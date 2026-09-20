@@ -1,0 +1,43 @@
+Copyright (c) 2026 Ashutosh. All Rights Reserved.
+
+This repository and all of its contents -- including but not limited to
+firmware source code, hardware design files (schematics, PCB layouts,
+Gerbers, and associated manufacturing files), enclosure models, artwork,
+documentation, and any other materials contained herein (collectively, the
+"Work") -- are the exclusive property of the copyright holder.
+
+NO LICENSE IS GRANTED. No permission is given to any person to copy,
+modify, merge, publish, distribute, sublicense, reproduce, reverse engineer,
+create derivative works from, or otherwise use the Work, in whole or in
+part, for any purpose, without the prior written consent of the copyright
+holder.
+
+This Work is shared publicly (where applicable) for viewing and evaluation
+purposes only -- for example, as part of a school project, competition
+submission, or sponsorship review. Visibility does not constitute, and must
+not be interpreted as, a grant of any license or usage right.
+
+DISCLAIMER OF WARRANTY
+
+THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY,
+WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF,
+OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS IN THE WORK.
+
+HARDWARE SAFETY NOTICE
+
+This Work involves electronics, battery charging circuitry, and a
+custom-built lithium battery system. Building, assembling, or operating a
+device based on this Work carries inherent risk (including but not limited
+to electrical, fire, and battery-related hazards). Anyone doing so assumes
+all associated risk. The copyright holder accepts no responsibility for
+injury, loss, or damage resulting from the construction or use of any
+device based on this Work.
+
+All product names, logos, and trademarks referenced in this Work belong to
+their respective owners and are used solely for identification purposes.
+
+For licensing inquiries or requests to use any part of this Work, contact
+the copyright holder directly.
