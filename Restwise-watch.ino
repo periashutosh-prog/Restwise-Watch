@@ -60,6 +60,23 @@ RTC_DS3231 rtc;
 #define PIN_SDA 14
 #define PIN_SCL 6
 
+// A full SSD1306 128x64 frame is 1024 GDDRAM bytes; the Adafruit driver adds a
+// handful of command/control bytes per transfer (~1040 bytes total). Each I2C
+// byte costs 9 bus clocks (8 data + 1 ACK), so one full-frame push costs
+// ~1040*9 = 9360 bits. At a 40 FPS display target that's 9360*40 = 374,400 bps
+// minimum with zero margin -- too tight to call comfortable once you add real
+// I2C protocol overhead (repeated starts, clock stretching, buffer refills).
+// Doubling that for real headroom lands at ~750kHz, so we run the bus at the
+// nearest standard rate above it: 1MHz (Fast Mode Plus), which every SSD1306
+// clone and the ESP32-C6's I2C peripheral both support.
+//
+// The DS3231 is NOT rated past 400kHz (Fast-mode) per its datasheet, so it
+// can't share the bus at 1MHz. Since it sits on the same SDA/SCL lines as the
+// OLED, the bus speed is switched down to 400kHz right around every RTC
+// transaction and restored afterward -- see I2C_CLOCK_DISPLAY/I2C_CLOCK_RTC.
+#define I2C_CLOCK_DISPLAY 1000000UL
+#define I2C_CLOCK_RTC     400000UL
+
 // Buttons (see wiring note above)
 #define BTN_UP     23
 #define BTN_DOWN   21
@@ -86,21 +103,29 @@ enum ScreenState {
   SCREEN_CALCULATOR, SCREEN_CALCULATOR_SCI,
   SCREEN_PIN_ENTRY, SCREEN_SECURITY_MENU, SCREEN_SECURITY_CONFIRM,
   SCREEN_LOCK_SETTINGS, SCREEN_TERMINAL,
-  SCREEN_RESTWISE, SCREEN_RESTWISE_DAY, SCREEN_GOODNIGHT
+  SCREEN_RESTWISE, SCREEN_RESTWISE_DAY, SCREEN_GOODNIGHT,
+  SCREEN_ANIMATOR
 };
 ScreenState currentScreen = SCREEN_WATCHFACE;
 
 bool lastButtonStates[5] = {false, false, false, false, false};
 bool buttonJustPressed[5] = {false, false, false, false, false};
 
-const int NUM_MENU_ITEMS = 8;
-const char* menuItems[NUM_MENU_ITEMS] = {"Restwise", "Stopwatch", "Timer", "Calculator", "Security", "Lock Screen", "Terminal", "Lock"};
+const int NUM_MENU_ITEMS = 9;
+const char* menuItems[NUM_MENU_ITEMS] = {"Restwise", "Stopwatch", "Timer", "Calculator", "Animator", "Security", "Lock Screen", "Terminal", "Lock"};
 int menuIndex = 0;
 
 unsigned long swStartTime = 0;
 unsigned long swElapsedTime = 0;
 bool swRunning = false;
 int swFocus = 0;
+
+// Animator: a scripted, looping reel of predefined vector animations.
+// Fully time-based (elapsed-ms driven), never frame-counted, so it stays
+// smooth and reproducible regardless of loop jitter or frame rate.
+int animatorSceneIndex = 0;
+unsigned long animatorSceneStart = 0;
+int animatorFps = 60; // user-selectable 10..60 in steps of 10
 
 enum TimerMode { TM_SETTING, TM_READY, TM_RUNNING, TM_RINGING };
 TimerMode tmMode = TM_SETTING;
@@ -282,6 +307,7 @@ void setDeviceTime(const DateTime &dt);
 void drawRestwise(int yOffset);
 void drawRestwiseDay(int yOffset);
 void drawGoodNight(int yOffset);
+void drawAnimator(int yOffset);
 void processRestwiseSerial();
 void rwLoadFromFile();
 int  rwBuildDayList(int dayIdx, int* out, int maxOut);
@@ -312,7 +338,7 @@ void setup() {
   setupButtons();
 
   Wire.begin(PIN_SDA, PIN_SCL);
-  Wire.setClock(400000); // 400kHz I2C for fast, flicker-free OLED refresh
+  Wire.setClock(I2C_CLOCK_DISPLAY); // 1MHz -- gives ~2.6x headroom over the 40 FPS OLED requirement
   delay(100);
 
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
@@ -327,7 +353,9 @@ void setup() {
 
   // The RTC is optional. If it isn't on the bus we log it and run on the
   // software clock -- the watch must never halt just because the DS3231 is
-  // missing.
+  // missing. DS3231 tops out at 400kHz, so the bus is dropped down for its
+  // transactions and restored to the display speed right after.
+  Wire.setClock(I2C_CLOCK_RTC);
   if (rtc.begin()) {
     rtcPresent = true;
     if (rtc.lostPower()) {
@@ -341,6 +369,7 @@ void setup() {
     softBaseMillis = millis();
     Serial.println(F("RTC NOT found - using software clock from 12:00"));
   }
+  Wire.setClock(I2C_CLOCK_DISPLAY);
 
   Serial.println(F("Display initialized!"));
 
@@ -401,7 +430,7 @@ void loop() {
   // Idle blanking runs on every screen the user might be sitting on. The single
   // exception is animations -- blanking mid-slide would strand the transition
   // halfway. This gives the Lock Screen timeout its intended global effect.
-  bool allowBlank = !isAnimating;
+  bool allowBlank = !isAnimating && currentScreen != SCREEN_ANIMATOR;
 
   if (displayOn && allowBlank) {
     if (millis() - lastActivityTime > DISPLAY_TIMEOUT_MS) {
@@ -481,6 +510,10 @@ void loop() {
             calcInput1 = ""; calcInput2 = ""; calcOp = ' '; calcIsOpSet = false; calcError = false;
             startAnimation(SCREEN_CALCULATOR, -64);
           } else if (menuIndex == 4) {
+            animatorSceneIndex = 0;
+            animatorSceneStart = millis();
+            startAnimation(SCREEN_ANIMATOR, -64);
+          } else if (menuIndex == 5) {
             if (pinSet) {
               pendingAction = ACT_OPEN_MENU;
               enterPinScreen(SEC_VERIFY, SCREEN_MENU);
@@ -489,19 +522,27 @@ void loop() {
               confirmSelection = 0;
               startAnimation(SCREEN_SECURITY_CONFIRM, -64);
             }
-          } else if (menuIndex == 5) {
+          } else if (menuIndex == 6) {
             lockSettingsCursor = -1;
             for (int i = 0; i < 4; i++) if (lockTimeoutOptions[i] == displayTimeoutSec) lockSettingsCursor = i;
             if (lockSettingsCursor == -1) lockSettingsCursor = 0;
             startAnimation(SCREEN_LOCK_SETTINGS, -64);
-          } else if (menuIndex == 6) {
+          } else if (menuIndex == 7) {
             termState = TERM_IDLE;
             termLineBuf = "";
             startAnimation(SCREEN_TERMINAL, -64);
-          } else if (menuIndex == 7) {
+          } else if (menuIndex == 8) {
             startAnimation(SCREEN_WATCHFACE, 64);
           }
         }
+      }
+      else if (currentScreen == SCREEN_ANIMATOR) {
+        // Passive playback screen -- the back box is always focused, CENTER exits.
+        if (buttonJustPressed[4]) {
+          startAnimation(SCREEN_MENU, 64);
+        }
+        if (buttonJustPressed[3] && animatorFps < 60) animatorFps += 10;
+        if (buttonJustPressed[2] && animatorFps > 10) animatorFps -= 10;
       }
       else if (currentScreen == SCREEN_STOPWATCH) {
 
@@ -914,7 +955,23 @@ void loop() {
       lastStatusUpdate = millis();
     }
 
-    updateDisplay();
+    // Cap the actual I2C push to the OLED at 60 FPS (~17ms). Button reads and
+    // animation stepping above still run every loop tick for responsiveness --
+    // only the expensive full-frame display.display() transfer is throttled.
+    // At the 1MHz bus speed a 60 FPS full-frame push needs ~561.6kbps, leaving
+    // ~1.78x headroom -- still comfortable, just less margin than 40 FPS had.
+    static unsigned long lastFrameTime = 0;
+    const unsigned long FRAME_INTERVAL_MS = 17; // ~1000/60
+    // The Animator lets the user pick its own cap. Animation is time-based,
+    // so a lower FPS plays at the same speed, just choppier.
+    unsigned long frameInterval = FRAME_INTERVAL_MS;
+    if (currentScreen == SCREEN_ANIMATOR && !isAnimating) {
+      frameInterval = (1000UL + animatorFps / 2) / animatorFps;
+    }
+    if (millis() - lastFrameTime >= frameInterval) {
+      lastFrameTime = millis();
+      updateDisplay();
+    }
   }
 
   delay(5);
@@ -943,7 +1000,12 @@ void readButtons() {
 }
 
 DateTime nowTime() {
-  if (rtcPresent) return rtc.now();
+  if (rtcPresent) {
+    Wire.setClock(I2C_CLOCK_RTC);
+    DateTime t = rtc.now();
+    Wire.setClock(I2C_CLOCK_DISPLAY);
+    return t;
+  }
   // Software clock: base time plus however long we've been running. Unsigned
   // subtraction keeps this correct across the millis() rollover.
   unsigned long elapsed = (millis() - softBaseMillis) / 1000UL;
@@ -951,7 +1013,11 @@ DateTime nowTime() {
 }
 
 void setDeviceTime(const DateTime &dt) {
-  if (rtcPresent) rtc.adjust(dt);
+  if (rtcPresent) {
+    Wire.setClock(I2C_CLOCK_RTC);
+    rtc.adjust(dt);
+    Wire.setClock(I2C_CLOCK_DISPLAY);
+  }
   // Always re-base the software clock too, so `set_time` works identically
   // whether or not a DS3231 happens to be attached.
   softBase = dt;
@@ -1040,6 +1106,7 @@ void drawScreen(ScreenState screen, int yOffset) {
   else if (screen == SCREEN_RESTWISE) drawRestwise(yOffset);
   else if (screen == SCREEN_RESTWISE_DAY) drawRestwiseDay(yOffset);
   else if (screen == SCREEN_GOODNIGHT) drawGoodNight(yOffset);
+  else if (screen == SCREEN_ANIMATOR) drawAnimator(yOffset);
 }
 
 void drawHeader(int yOffset, const char* appName, bool backFocused) {
@@ -1951,4 +2018,158 @@ void drawGoodNight(int yOffset) {
 
   display.setTextColor(SSD1306_WHITE);
   drawCenteredText(display, "Good Night!", 50 + yOffset, 1);
+}
+
+/* ---------------------------- Animator ---------------------------- */
+// An endless rainy loop: a small cloud rains continuously, and on a fixed but
+// uneven schedule (so it feels occasional, not metronomic) a lightning bolt
+// draws itself out of the cloud, the sky flashes white from the center
+// outward, and then it goes straight back to rain. Everything is time-driven,
+// never frame-counted, so it stays smooth at any frame rate. CENTER (the
+// always-focused back box) exits.
+
+const int ANIM_TOP = 13;    // just under the header bar
+const int ANIM_BOTTOM = 63;
+const int CLOUD_BOTTOM = 32;
+
+void animDrawCloud(int yOffset) {
+  // Circles only -- no rects, so no flat edge anywhere. A bumpy top row plus
+  // an offset bottom row gives a scalloped, rounded underside.
+  int cy = 23 + yOffset; // top puffs peak at y=14, clear of the header bar
+  const int topX[7]  = {22, 36, 50, 64, 78, 92, 106};
+  const int topR[7]  = {6,  7,  7,  7,  7,  7,  6};
+  const int topDy[7] = {-1, -2, -2, -2, -2, -2, -1};
+  for (int i = 0; i < 7; i++) {
+    display.fillCircle(topX[i], cy + topDy[i], topR[i], SSD1306_WHITE);
+  }
+  const int botX[8] = {15, 29, 43, 57, 71, 85, 99, 113};
+  const int botR[8] = {5,  6,  6,  6,  6,  6,  6,  5};
+  for (int i = 0; i < 8; i++) {
+    display.fillCircle(botX[i], cy + 3, botR[i], SSD1306_WHITE);
+  }
+}
+
+struct RainDrop { uint8_t x; uint16_t speed; uint16_t phase; };
+const int NUM_RAINDROPS = 10;
+const RainDrop rainDrops[NUM_RAINDROPS] = {
+  {16,  90,   0}, {26, 130, 300}, {36,  80, 600}, {46, 150, 100},
+  {56, 100, 900}, {66, 140, 200}, {76,  85, 500}, {86, 120, 800},
+  {98, 110, 400}, {110, 95, 700}
+};
+
+void animDrawRainField(int yOffset) {
+  // Falls from the cloud's underside to the bottom of the constrained area.
+  // Driven by absolute time (not per-scene elapsed) so drops flow
+  // continuously across rain/thunder transitions instead of jumping. 64-bit
+  // math so the position never glitches when millis() * speed would overflow.
+  const int top = CLOUD_BOTTOM + 1, span = ANIM_BOTTOM - top;
+  uint64_t now = millis();
+  for (int i = 0; i < NUM_RAINDROPS; i++) {
+    uint64_t t = now + rainDrops[i].phase;
+    int y = top + (int)((t * rainDrops[i].speed / 1000) % span);
+    int x = rainDrops[i].x;
+    display.drawLine(x,     y + yOffset, x - 3, y + 7 + yOffset, SSD1306_WHITE);
+    display.drawLine(x + 1, y + yOffset, x - 2, y + 7 + yOffset, SSD1306_WHITE);
+  }
+}
+
+// Bolt shape as offsets from a per-strike base x, starting inside the cloud's
+// underside and zigzagging down to the bottom edge.
+const int NUM_BOLT_PTS = 7;
+const int boltDX[NUM_BOLT_PTS] = {0, -12, -2, -18, -4, -20, -8};
+const int boltY[NUM_BOLT_PTS]  = {30, 37, 41, 48, 52, 58, 63};
+const unsigned long BOLT_DRAW_MS = 900;   // time to fully draw the bolt
+const unsigned long WHITEOUT_MS  = 900;   // time to fade the screen to white
+const unsigned long THUNDER_HOLD_MS = 200; // hold full white briefly
+const unsigned long THUNDER_TOTAL_MS = BOLT_DRAW_MS + WHITEOUT_MS + THUNDER_HOLD_MS;
+
+void animDrawBoltThick(int x0, int y0, int x1, int y1, int yOffset) {
+  // 5 parallel offset strokes (~3x the previous double-stroke width).
+  for (int o = -2; o <= 2; o++) {
+    display.drawLine(x0 + o, y0 + yOffset, x1 + o, y1 + yOffset, SSD1306_WHITE);
+  }
+}
+
+void animDrawThunder(int yOffset, unsigned long elapsed, int baseX) {
+  // The bolt draws itself in, one segment at a time, instead of popping in.
+  const unsigned long segMs = BOLT_DRAW_MS / (NUM_BOLT_PTS - 1);
+  unsigned long boltElapsed = min(elapsed, BOLT_DRAW_MS);
+  int fullSegs = boltElapsed / segMs;
+  for (int i = 0; i < fullSegs && i < NUM_BOLT_PTS - 1; i++) {
+    animDrawBoltThick(baseX + boltDX[i], boltY[i], baseX + boltDX[i + 1], boltY[i + 1], yOffset);
+  }
+  if (fullSegs < NUM_BOLT_PTS - 1) {
+    float segFrac = (float)(boltElapsed - fullSegs * segMs) / segMs;
+    int x0 = baseX + boltDX[fullSegs], x1 = baseX + boltDX[fullSegs + 1];
+    int mx = x0 + (int)((x1 - x0) * segFrac);
+    int my = boltY[fullSegs] + (int)((boltY[fullSegs + 1] - boltY[fullSegs]) * segFrac);
+    animDrawBoltThick(x0, boltY[fullSegs], mx, my, yOffset);
+  }
+
+  // Once the bolt is fully drawn, the screen (constrained area only) fades to
+  // white as a ring expanding outward from the exact center of the
+  // constrained area -- a growing "iris" rather than a scattered fade.
+  // Slightly oversized radii so the ring visibly overshoots the edges before
+  // the final frame snaps to a guaranteed full fillRect (an ellipse alone
+  // can never quite reach a rectangle's corners).
+  if (elapsed > BOLT_DRAW_MS) {
+    unsigned long whiteElapsed = elapsed - BOLT_DRAW_MS;
+    if (whiteElapsed >= WHITEOUT_MS) {
+      display.fillRect(0, ANIM_TOP + yOffset, 128, 50, SSD1306_WHITE);
+    } else {
+      float f = (float)whiteElapsed / (float)WHITEOUT_MS;
+      int cx = 64, cy = ANIM_TOP + 25;
+      float rx = 70.0f * f, ry = 30.0f * f;
+      if (ry >= 1.0f) {
+        for (int y = ANIM_TOP; y < ANIM_BOTTOM; y++) {
+          float dy = (float)(y - cy);
+          float t = 1.0f - (dy * dy) / (ry * ry);
+          if (t > 0) {
+            float halfw = rx * sqrtf(t);
+            int x0 = cx - (int)halfw, x1 = cx + (int)halfw;
+            if (x0 < 0) x0 = 0;
+            if (x1 > 127) x1 = 127;
+            if (x1 >= x0) display.drawFastHLine(x0, y + yOffset, x1 - x0 + 1, SSD1306_WHITE);
+          }
+        }
+      }
+    }
+  }
+}
+
+// Rain stretches between strikes, deliberately uneven so thunder feels
+// occasional. Each strike lands at its own x so no two in a row look alike.
+const int NUM_STRIKES = 4;
+const unsigned long rainGapMs[NUM_STRIKES] = {4000, 7000, 3000, 5500};
+const int strikeX[NUM_STRIKES] = {72, 44, 94, 60};
+
+void drawAnimator(int yOffset) {
+  drawHeader(yOffset, "ANIMATOR", true); // back box always focused -- CENTER exits
+
+  // animatorSceneIndex alternates: even = rain gap, odd = thunder strike.
+  int strike = (animatorSceneIndex / 2) % NUM_STRIKES;
+  bool thunder = (animatorSceneIndex % 2) == 1;
+  unsigned long duration = thunder ? THUNDER_TOTAL_MS : rainGapMs[strike];
+
+  unsigned long elapsed = millis() - animatorSceneStart;
+  if (elapsed >= duration) {
+    animatorSceneIndex = (animatorSceneIndex + 1) % (NUM_STRIKES * 2);
+    animatorSceneStart = millis();
+    elapsed = 0;
+    strike = (animatorSceneIndex / 2) % NUM_STRIKES;
+    thunder = (animatorSceneIndex % 2) == 1;
+  }
+
+  animDrawCloud(yOffset);
+  animDrawRainField(yOffset);
+  if (thunder) animDrawThunder(yOffset, elapsed, strikeX[strike]);
+
+  // FPS box, bottom-left, drawn last with a black fill so rain and the
+  // whiteout never cover it. LEFT -10 / RIGHT +10.
+  display.fillRect(0, 51 + yOffset, 17, 13, SSD1306_BLACK);
+  display.drawRect(0, 51 + yOffset, 17, 13, SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(3, 54 + yOffset);
+  display.print(animatorFps);
 }
