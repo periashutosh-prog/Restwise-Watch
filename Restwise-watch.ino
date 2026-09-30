@@ -45,9 +45,22 @@
 #include <EEPROM.h>
 #include <LittleFS.h>
 #include <WiFi.h>
+#include <WiFiUdp.h>
 #include <RTClib.h>
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_GFX.h>
+#include "esp_sleep.h"
+#include <Preferences.h>
+#include <HTTPClient.h>
+#include "time.h"
+
+// Master switch for the WiFi app/feature. Flip to false to hard-block the
+// radio from ever being enabled (even if the UI is still reachable) without
+// ripping the feature out -- useful for a strict "radio-off" competition
+// build. Does NOT affect the boot-time WiFi.mode(WIFI_OFF)/btStop() below --
+// the watch is always radio-off at boot regardless; this only gates whether
+// the WiFi app is allowed to actually turn the radio on when asked to.
+const bool WIFI_APP_ENABLED = true;
 
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
@@ -84,6 +97,8 @@ RTC_DS3231 rtc;
 #define BTN_RIGHT  20
 #define BTN_CENTER 3
 
+#define PIN_BATTERY_ADC 2 // IO2 = ADC1_CH2
+
 bool buttonStates[5] = {false, false, false, false, false};
 const uint8_t buttonPins[5] = {BTN_UP, BTN_DOWN, BTN_LEFT, BTN_RIGHT, BTN_CENTER};
 
@@ -104,15 +119,18 @@ enum ScreenState {
   SCREEN_PIN_ENTRY, SCREEN_SECURITY_MENU, SCREEN_SECURITY_CONFIRM,
   SCREEN_LOCK_SETTINGS, SCREEN_TERMINAL,
   SCREEN_RESTWISE, SCREEN_RESTWISE_DAY, SCREEN_GOODNIGHT,
-  SCREEN_ANIMATOR
+  SCREEN_ANIMATOR, SCREEN_BATTERY,
+  SCREEN_WIFI_CONFIRM, SCREEN_WIFI_SCANNING, SCREEN_WIFI_RESULTS,
+  SCREEN_WIFI_PASSWORD, SCREEN_WIFI_KEYBOARD, SCREEN_WIFI_HOME,
+  SCREEN_WIFI_TOGGLE_CONFIRM, SCREEN_WIFI_FORGET_CONFIRM, SCREEN_WIFI_NTP
 };
 ScreenState currentScreen = SCREEN_WATCHFACE;
 
 bool lastButtonStates[5] = {false, false, false, false, false};
 bool buttonJustPressed[5] = {false, false, false, false, false};
 
-const int NUM_MENU_ITEMS = 9;
-const char* menuItems[NUM_MENU_ITEMS] = {"Restwise", "Stopwatch", "Timer", "Calculator", "Animator", "Security", "Lock Screen", "Terminal", "Lock"};
+const int NUM_MENU_ITEMS = 11;
+const char* menuItems[NUM_MENU_ITEMS] = {"Restwise", "Stopwatch", "Timer", "Calculator", "Animator", "Battery", "WiFi", "Security", "Lock Screen", "Terminal", "Lock"};
 int menuIndex = 0;
 
 unsigned long swStartTime = 0;
@@ -126,6 +144,104 @@ int swFocus = 0;
 int animatorSceneIndex = 0;
 unsigned long animatorSceneStart = 0;
 int animatorFps = 60; // user-selectable 10..60 in steps of 10
+
+// ---- WiFi app (ported from AIO_Transmitter's WiFi UI/keyboard/focus-nav) ----
+// wifiEnabled reflects the user's explicit on/off choice for this session --
+// never set true automatically. There is no boot-time auto-connect by design.
+bool wifiEnabled       = false;
+int  wifiScanResults   = 0;
+int  wifiListIndex     = -1;
+int  wifiListScroll    = 0;
+String wifiTargetSSID  = "";
+String wifiPassword    = "";
+String wifiStatusMsg   = "";
+bool wifiConnecting    = false;
+unsigned long wifiScanStart        = 0;
+unsigned long wifiConnectStartTime = 0;
+int wifiHomeCursor     = -1;
+int wifiConfirmCursor  = 0;
+int wifiToggleCursor   = 0;
+int wifiForgetCursor   = 1;
+String wifiForgetTargetSSID = "";
+int wifiPasswordCursor = 1;
+int wifiRetryCount     = 0;
+
+Preferences prefs;
+const int MAX_SAVED_NETS = 5;
+String savedSSIDs[MAX_SAVED_NETS];
+String savedPWDs[MAX_SAVED_NETS];
+int savedNetCount = 0;
+String lastConnectedSSID = "";
+
+// Four independent, non-government NTP sources, queried in PARALLEL by four
+// FreeRTOS tasks (raw SNTP over WiFiUDP -- bypasses the OS-level SNTP client
+// entirely, sidestepping the stale-session class of bug that single-server
+// configTime() hit). Whichever returns is used; if more than one has returned
+// by the time we decide, the higher-priority one wins. Priority = list order
+// (index 0 = highest).
+const char* NTP_SERVERS[4] = {"time.google.com", "pool.ntp.org", "time.apple.com", "in.pool.ntp.org"};
+const int NUM_NTP_SERVERS = 4;
+const long  NTP_GMT_OFFSET_SEC = 19800; // IST (UTC+5:30)
+const unsigned long NTP_TIMEOUT_MS = 20000;      // overall budget for all 4 tasks
+const unsigned long NTP_PER_SERVER_TIMEOUT_MS = 8000; // one task's own UDP wait
+const unsigned long NTP_RESULT_HOLD_MS = 5000;
+
+volatile bool     ntpSlotDone[4]  = {false, false, false, false};
+volatile bool     ntpSlotOk[4]    = {false, false, false, false};
+volatile uint32_t ntpSlotEpoch[4] = {0, 0, 0, 0}; // Unix seconds, UTC
+
+// Manual NTP Sync screen state. Polled non-blockingly (like the WiFi scan),
+// never a single long blocking call -- that would freeze button polling and
+// the "Syncing" animation for up to 20s straight.
+int wifiNtpState = 0; // 0 = syncing, 1 = success, 2 = failed
+int wifiNtpBestServer = -1; // index into NTP_SERVERS that actually provided the time
+String wifiNtpResultMsg = "";
+unsigned long wifiNtpStart  = 0;
+unsigned long wifiNtpDoneAt = 0;
+
+// Real internet reachability (not just "associated to an AP"), ported from
+// AIO_Transmitter's connectivityTask -- rotates through 5 known 204-response
+// endpoints, one check/sec, and treats internet as up if ANY of the last 5
+// succeeded (so one dead endpoint doesn't false-negative the whole check).
+bool internetOK    = false;
+bool pingerStatus[5] = {false, false, false, false, false};
+bool pingerStarted = false;
+
+// 8x8 status icons for the watchface, MSB-first, one byte per row.
+static const uint8_t PROGMEM wifi_bmp[] = {
+  0x00, 0x7E, 0x81, 0x3C, 0x42, 0x18, 0x00, 0x18
+};
+static const uint8_t PROGMEM tower_bmp[] = {
+  0x18, 0x24, 0x42, 0x18, 0x18, 0x18, 0x3C, 0x7E
+};
+
+// On-screen QWERTY keyboard (same grid/focus-nav as AIO_Transmitter's).
+enum KBMode { KB_LOWER, KB_UPPER, KB_SYMBOL };
+KBMode currentKBMode = KB_LOWER;
+int kbCursorRow = 0, kbCursorCol = 0;
+String kbInputBuffer = "";
+int kbTextCursor   = 0;
+int kbScrollOffset = 0;
+ScreenState kbReturnScreen = SCREEN_WIFI_PASSWORD;
+
+const char* kbLower[4][11] = {
+  {"q","w","e","r","t","y","u","i","o","p","."},
+  {"a","s","d","f","g","h","j","k","l",",","?"},
+  {"z","x","c","v","b","n","m","<",">","^","BS"},
+  {"1","2","3","4","5","6","7","8","9"," ","EN"}
+};
+const char* kbUpper[4][11] = {
+  {"Q","W","E","R","T","Y","U","I","O","P","."},
+  {"A","S","D","F","G","H","J","K","L",",","?"},
+  {"Z","X","C","V","B","N","M","<",">","^","BS"},
+  {"!","@","#","$","%","^","&","*","("," ","EN"}
+};
+const char* kbSymbol[4][11] = {
+  {"1","2","3","4","5","6","7","8","9","0","~"},
+  {"@","$","%","&","*","-","+","=","!","|","\\"},
+  {"/","?",";",":","`","(",")","CL","CR","^","BS"},
+  {"[","]","{","}","<",">","#","_","."," ","EN"}
+};
 
 enum TimerMode { TM_SETTING, TM_READY, TM_RUNNING, TM_RINGING };
 TimerMode tmMode = TM_SETTING;
@@ -146,6 +262,15 @@ unsigned long lastActivityTime = 0;
 const int lockTimeoutOptions[4] = {5, 10, 15, 30};
 int displayTimeoutSec = 5;
 unsigned long DISPLAY_TIMEOUT_MS = 5000;
+
+// After 90s of true inactivity the watch drops into deep sleep rather than
+// just blanking the display. Only GPIO0-7 sit in the ESP32-C6's LP domain,
+// so CENTER (GPIO3) is the only button physically capable of waking it from
+// deep sleep -- UP/DOWN/LEFT/RIGHT cannot. Deep sleep is a full chip reset,
+// so currentScreen's global initializer (SCREEN_WATCHFACE) is what actually
+// guarantees "always wake on the watchface" -- nothing extra is needed for
+// that part.
+const unsigned long DEEP_SLEEP_TIMEOUT_MS = 90000;
 bool displayOn = true;
 int lockSettingsCursor = 0;
 
@@ -314,6 +439,560 @@ int  rwBuildDayList(int dayIdx, int* out, int maxOut);
 int  rwResolveDayIndex(int item);
 const char* rwDayName(int item);
 bool isNightNow();
+void enterDeepSleep();
+void drawBattery(int yOffset);
+void drawWifiConfirm(int yOffset);
+void drawWifiScanning(int yOffset);
+void drawWifiResults(int yOffset);
+void drawWifiPassword(int yOffset);
+void drawWifiKeyboard();
+void drawWifiHome(int yOffset);
+void drawWifiToggleConfirm(int yOffset);
+void drawWifiForgetConfirm(int yOffset);
+void loadCredentials();
+void saveCredential(String ssid, String pwd);
+void forgetCredential(String ssid);
+String findSavedPwd(String ssid);
+bool ntpQueryOnce(const char* host, uint32_t &outUnixTime, unsigned long timeoutMs);
+void ntpQueryTask(void *pv);
+void startNtpSync();
+void drawWifiNTP(int yOffset);
+void connectivityTask(void *p);
+void startConnectivityPinger();
+void drawWifiStatusIcon(int x, int y);
+void drawTowerStatusIcon(int x, int y);
+void drawBatteryIcon(int x, int y);
+
+/* ---------------------------- Battery monitoring ---------------------------- */
+// A dedicated FreeRTOS task samples the ADC 1000x/sec and posts one averaged
+// reading per second -- kept off the main loop() so UI drawing and button
+// polling are never blocked by sampling. Single writer (this task), single
+// reader (everything else), so plain volatiles are enough -- no mutex needed.
+
+// Divider: BAT+ --[10k]-- IO2 --[20k]-- GND, so Vbat = Vadc * (10k+20k)/20k.
+// A 4.2V-charged cell lands at ~2.8V on IO2, comfortably inside the ADC's
+// usable range under 11dB attenuation.
+const float BATTERY_DIVIDER_RATIO = 1.5f;
+const int BATTERY_SAMPLES_PER_SEC = 1000;
+
+volatile float batteryVoltage = 0.0f;
+volatile int batteryAdcRaw = 0;        // averaged raw 12-bit ADC count (0-4095), for display/debug
+volatile int batteryAdcMilliVolts = 0; // averaged, calibrated pin voltage (pre-divider), for display/debug
+volatile bool batteryReadingValid = false;
+
+// Rolling ~8-second history of the once-a-second averages, used to detect a
+// charging cell: CC/CV charging makes voltage climb steadily, so a clear rise
+// across this window means "charging", not sensor noise on a single sample.
+const int BATTERY_HISTORY_LEN = 8;
+volatile float batteryHistory[BATTERY_HISTORY_LEN];
+volatile int batteryHistoryCount = 0;
+volatile int batteryHistoryHead = 0;
+volatile bool batteryCharging = false;
+const float BATTERY_CHARGE_RISE_THRESHOLD = 0.02f; // volts, over the history window
+
+// Piecewise-linear 1S LiPo voltage -> percent curve at a moderate (~500mA-ish)
+// discharge rate -- far more accurate near the ends than a naive linear
+// 3.0V-4.2V map, since LiPo voltage sags fast at the bottom and plateaus
+// through the middle.
+struct BatteryCurvePoint { float voltage; int percent; };
+const int NUM_BATTERY_CURVE_PTS = 11;
+const BatteryCurvePoint batteryCurve[NUM_BATTERY_CURVE_PTS] = {
+  {3.27f, 0}, {3.61f, 5}, {3.69f, 10}, {3.73f, 20}, {3.77f, 30}, {3.80f, 40},
+  {3.84f, 50}, {3.87f, 60}, {3.95f, 70}, {4.08f, 85}, {4.20f, 100}
+};
+
+int batteryVoltageToPercent(float v) {
+  if (v <= batteryCurve[0].voltage) return 0;
+  if (v >= batteryCurve[NUM_BATTERY_CURVE_PTS - 1].voltage) return 100;
+  for (int i = 0; i < NUM_BATTERY_CURVE_PTS - 1; i++) {
+    if (v >= batteryCurve[i].voltage && v <= batteryCurve[i + 1].voltage) {
+      float span = batteryCurve[i + 1].voltage - batteryCurve[i].voltage;
+      float frac = (span > 0) ? (v - batteryCurve[i].voltage) / span : 0;
+      return batteryCurve[i].percent + (int)(frac * (batteryCurve[i + 1].percent - batteryCurve[i].percent));
+    }
+  }
+  return 0;
+}
+
+void batteryAdcTask(void *pvParameters) {
+  analogReadResolution(12);
+  analogSetPinAttenuation(PIN_BATTERY_ADC, ADC_11db);
+
+  for (;;) {
+    uint32_t sumMv = 0, sumRaw = 0;
+    for (int i = 0; i < BATTERY_SAMPLES_PER_SEC; i++) {
+      sumMv += analogReadMilliVolts(PIN_BATTERY_ADC);
+      sumRaw += analogRead(PIN_BATTERY_ADC);
+      vTaskDelay(1); // ~1ms tick -> ~1000 samples spread across ~1 second
+    }
+    float avgMilliVolts = (float)sumMv / BATTERY_SAMPLES_PER_SEC;
+    float vBat = (avgMilliVolts / 1000.0f) * BATTERY_DIVIDER_RATIO;
+
+    batteryVoltage = vBat;
+    batteryAdcRaw = sumRaw / BATTERY_SAMPLES_PER_SEC;
+    batteryAdcMilliVolts = (int)avgMilliVolts;
+    batteryReadingValid = true;
+
+    batteryHistory[batteryHistoryHead] = vBat;
+    batteryHistoryHead = (batteryHistoryHead + 1) % BATTERY_HISTORY_LEN;
+    if (batteryHistoryCount < BATTERY_HISTORY_LEN) batteryHistoryCount++;
+
+    if (batteryHistoryCount == BATTERY_HISTORY_LEN) {
+      int oldestIdx = batteryHistoryHead; // head now points at the oldest slot
+      float oldest = batteryHistory[oldestIdx];
+      batteryCharging = (vBat - oldest) > BATTERY_CHARGE_RISE_THRESHOLD;
+    }
+  }
+}
+
+// Small outline-plus-fill glyph, 4 segments. (x,y) is its top-left corner.
+void drawBatteryIcon(int x, int y) {
+  // While charging, the whole icon blinks (500ms on/off) instead of sitting
+  // static, so a glance at the watchface shows charging state at a glance.
+  if (batteryCharging && ((millis() / 500) % 2 == 1)) return;
+
+  display.drawRect(x, y, 14, 8, SSD1306_WHITE);
+  display.fillRect(x + 14, y + 2, 2, 4, SSD1306_WHITE); // + terminal nub
+
+  int percent = batteryReadingValid ? batteryVoltageToPercent(batteryVoltage) : 0;
+  int segments = (percent * 4 + 50) / 100;
+  if (segments > 4) segments = 4;
+
+  for (int i = 0; i < segments; i++) {
+    display.fillRect(x + 1 + i * 3, y + 2, 2, 4, SSD1306_WHITE);
+  }
+}
+
+void drawBattery(int yOffset) {
+  drawHeader(yOffset, "BATTERY", true); // back box always focused -- CENTER exits
+
+  float v = batteryVoltage;
+  int percent = batteryVoltageToPercent(v);
+
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  char buf[24];
+
+  display.setCursor(2, 18 + yOffset);
+  if (batteryReadingValid) sprintf(buf, "Voltage: %.2fV", v);
+  else strcpy(buf, "Voltage: --");
+  display.print(buf);
+
+  display.setCursor(2, 30 + yOffset);
+  if (batteryReadingValid) sprintf(buf, "Est. Battery: %d%%", percent);
+  else strcpy(buf, "Est. Battery: --");
+  display.print(buf);
+
+  display.setCursor(2, 42 + yOffset);
+  if (batteryReadingValid) sprintf(buf, "ADC: %d (%dmV)", batteryAdcRaw, batteryAdcMilliVolts);
+  else strcpy(buf, "ADC: --");
+  display.print(buf);
+
+  display.setCursor(2, 54 + yOffset);
+  display.print("Charging: ");
+  display.print(batteryCharging ? "True" : "False");
+}
+
+/* ---------------------------- WiFi app ---------------------------- */
+// Ported from AIO_Transmitter's WiFi UI: same screen flow, keyboard grid, and
+// focus-nav logic. Trimmed down to what was actually asked for here -- no
+// boot-time auto-connect, no "Auto On" toggle, no connectivity pinger/forbidden-
+// network list (those exist in AIO to support its own auto-reconnect-at-boot
+// feature, which this watch deliberately does not have).
+
+void drawWifiConfirm(int yOffset) {
+  drawHeader(yOffset, "WiFi", (wifiConfirmCursor == -1));
+  display.setTextColor(SSD1306_WHITE);
+  drawCenteredText(display, "WiFi is OFF", 22 + yOffset, 1);
+  drawCenteredText(display, "Turn it on?",  33 + yOffset, 1);
+  drawBoxedCenteredText(display, "YES", 14, 48 + yOffset, 40, 13, (wifiConfirmCursor == 0));
+  drawBoxedCenteredText(display, "NO",  74, 48 + yOffset, 40, 13, (wifiConfirmCursor == 1));
+}
+
+void drawWifiScanning(int yOffset) {
+  drawHeader(yOffset, "WiFi");
+  display.setTextColor(SSD1306_WHITE);
+  drawCenteredText(display, "SCANNING...", 30 + yOffset, 1);
+  int dots = ((millis() - wifiScanStart) / 500) % 4;
+  String dotStr = "";
+  for (int i = 0; i < dots; i++) dotStr += ".";
+  drawCenteredText(display, dotStr, 42 + yOffset, 1);
+}
+
+void drawWifiResults(int yOffset) {
+  drawHeader(yOffset, "WiFi", (wifiListIndex == -1));
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextWrap(false);
+
+  if (wifiScanResults <= 0) {
+    drawCenteredText(display, "No networks found", 30 + yOffset, 1);
+    display.setTextWrap(true);
+    return;
+  }
+
+  const int visibleItems = 4;
+  if (wifiListIndex > -1) {
+    if (wifiListIndex < wifiListScroll) wifiListScroll = wifiListIndex;
+    if (wifiListIndex >= wifiListScroll + visibleItems) wifiListScroll = wifiListIndex - visibleItems + 1;
+  }
+
+  for (int i = 0; i < visibleItems; i++) {
+    int netIdx = wifiListScroll + i;
+    if (netIdx >= wifiScanResults) break;
+    int y = 16 + (i * 12) + yOffset;
+    bool selected = (wifiListIndex == netIdx);
+    if (selected) { display.fillRect(0, y - 1, 122, 12, SSD1306_WHITE); display.setTextColor(SSD1306_BLACK); }
+    else          { display.setTextColor(SSD1306_WHITE); }
+    display.setCursor(4, y);
+    String ssid = WiFi.SSID(netIdx);
+    if (ssid.length() == 0) ssid = "(hidden)";
+    if (ssid.length() > 17) ssid = ssid.substring(0, 16) + "~";
+    display.print(ssid);
+
+    int rssi = WiFi.RSSI(netIdx);
+    int bars = (rssi > -60) ? 3 : (rssi > -75) ? 2 : 1;
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(118, y);
+    display.print(bars == 3 ? ":" : bars == 2 ? "." : ",");
+  }
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextWrap(true);
+
+  if (wifiScanResults > visibleItems) {
+    int trackH = 48;
+    int sbH    = max(4, (visibleItems * trackH) / wifiScanResults);
+    int sbY    = 16 + ((wifiListScroll * (trackH - sbH)) / (wifiScanResults - visibleItems));
+    display.drawFastVLine(126, 16 + yOffset, trackH, SSD1306_WHITE);
+    display.fillRect(125, sbY + yOffset, 3, sbH, SSD1306_WHITE);
+  }
+}
+
+void drawWifiPassword(int yOffset) {
+  drawHeader(yOffset, "WiFi", (wifiPasswordCursor == -1));
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextWrap(false);
+
+  display.setCursor(4, 16 + yOffset);
+  String ssid = wifiTargetSSID;
+  if (ssid.length() > 18) ssid = ssid.substring(0, 17) + "~";
+  display.print(ssid);
+  display.setTextWrap(true);
+
+  display.drawRect(4, 25 + yOffset, 120, 13, SSD1306_WHITE);
+  display.setCursor(8, 28 + yOffset);
+  String pw = wifiPassword;
+  if (pw.length() > 15) pw = pw.substring(pw.length() - 15);
+  if (pw.length() == 0) { display.setTextColor(0xAAAA); display.print("[tap to enter]"); }
+  else display.print(pw);
+  display.setTextColor(SSD1306_WHITE);
+
+  if (wifiStatusMsg.length() > 0) {
+    display.setCursor(4, 40 + yOffset);
+    display.print(wifiStatusMsg);
+  }
+
+  drawBoxedCenteredText(display, "KEYBOARD", 4,  51 + yOffset, 54, 12, (wifiPasswordCursor == 0));
+  drawBoxedCenteredText(display, "CONNECT",  62, 51 + yOffset, 60, 12, (wifiPasswordCursor == 1));
+}
+
+void drawWifiKeyboard() {
+  display.setTextColor(SSD1306_WHITE);
+  display.drawRect(0, 0, 128, 12, SSD1306_WHITE);
+  display.setCursor(4, 3);
+
+  if (kbTextCursor < kbScrollOffset) kbScrollOffset = kbTextCursor;
+  if (kbTextCursor > kbScrollOffset + 17) kbScrollOffset = kbTextCursor - 17;
+
+  String disp = kbInputBuffer.substring(kbScrollOffset);
+  if (disp.length() > 18) disp = disp.substring(0, 18);
+
+  if (kbInputBuffer.length() == 0) {
+    display.setTextColor(0x5555);
+    display.print("Type password...");
+    display.setTextColor(SSD1306_WHITE);
+  } else {
+    display.print(disp);
+  }
+
+  if ((millis() / 500) % 2 == 0) {
+    int cursorPx = 4 + ((kbTextCursor - kbScrollOffset) * 6);
+    display.drawFastVLine(cursorPx, 2, 9, SSD1306_WHITE);
+  }
+
+  for (int r = 0; r < 4; r++) {
+    for (int c = 0; c < 11; c++) {
+      const char* key;
+      if (currentKBMode == KB_UPPER)   key = kbUpper[r][c];
+      else if (currentKBMode == KB_SYMBOL) key = kbSymbol[r][c];
+      else key = kbLower[r][c];
+
+      int x = (c * 128) / 11;
+      int w = ((c + 1) * 128) / 11 - x;
+      int y = 13 + (r * 51) / 4;
+      int h = (13 + ((r + 1) * 51) / 4) - y;
+
+      drawBoxedCenteredText(display, key, x, y, w, h, (r == kbCursorRow && c == kbCursorCol));
+    }
+  }
+}
+
+void drawWifiHome(int yOffset) {
+  drawHeader(yOffset, "WiFi", (wifiHomeCursor == -1));
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextWrap(false);
+
+  display.setCursor(4, 16 + yOffset);
+  display.print("Internet: "); display.print(internetOK ? "OK" : "OFFLINE");
+  display.setCursor(4, 25 + yOffset);
+  display.print("SSID: ");
+  String ssid = WiFi.SSID();
+  if (ssid.length() > 12) ssid = ssid.substring(0, 11) + "~";
+  display.print(ssid);
+  display.setTextWrap(true);
+
+  const char* opts[3] = {"WiFi: ON", "Forget Network", "NTP Sync"};
+  for (int i = 0; i < 3; i++) {
+    int y = 36 + (i * 10) + yOffset;
+    bool sel = (wifiHomeCursor == i);
+    if (sel) { display.fillRect(0, y - 1, 128, 10, SSD1306_WHITE); display.setTextColor(SSD1306_BLACK); }
+    else      { display.setTextColor(SSD1306_WHITE); }
+    display.setCursor(4, y);
+    display.print(opts[i]);
+  }
+  display.setTextColor(SSD1306_WHITE);
+}
+
+void drawWifiToggleConfirm(int yOffset) {
+  drawHeader(yOffset, "WiFi");
+  display.setTextColor(SSD1306_WHITE);
+  drawCenteredText(display, "Turn off WiFi?", 22 + yOffset, 1);
+  drawBoxedCenteredText(display, "YES", 14, 48 + yOffset, 40, 13, (wifiToggleCursor == 0));
+  drawBoxedCenteredText(display, "NO",  74, 48 + yOffset, 40, 13, (wifiToggleCursor == 1));
+}
+
+void drawWifiForgetConfirm(int yOffset) {
+  drawHeader(yOffset, "WiFi");
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextWrap(false);
+  drawCenteredText(display, "Forget Network?", 18 + yOffset, 1);
+  String ssid = wifiForgetTargetSSID;
+  if (ssid.length() > 18) ssid = ssid.substring(0, 17) + "~";
+  String quoted = "\"" + ssid + "\"";
+  drawCenteredText(display, quoted, 30 + yOffset, 1);
+  display.setTextWrap(true);
+  drawBoxedCenteredText(display, "YES", 14, 48 + yOffset, 40, 13, (wifiForgetCursor == 0));
+  drawBoxedCenteredText(display, "NO",  74, 48 + yOffset, 40, 13, (wifiForgetCursor == 1));
+}
+
+/* ---- WiFi credential storage (NVS via Preferences, same as AIO_Transmitter) ---- */
+
+void loadCredentials() {
+  prefs.begin("wifi_creds", true);
+  savedNetCount = prefs.getInt("count", 0);
+  for (int i = 0; i < savedNetCount && i < MAX_SAVED_NETS; i++) {
+    savedSSIDs[i] = prefs.getString(("ssid" + String(i)).c_str(), "");
+    savedPWDs[i]  = prefs.getString(("pwd"  + String(i)).c_str(), "");
+  }
+  prefs.end();
+}
+
+void saveCredential(String ssid, String pwd) {
+  lastConnectedSSID = ssid;
+  for (int i = 0; i < savedNetCount; i++) {
+    if (savedSSIDs[i] == ssid) { savedPWDs[i] = pwd; goto writeAll; }
+  }
+  if (savedNetCount < MAX_SAVED_NETS) {
+    savedSSIDs[savedNetCount] = ssid;
+    savedPWDs[savedNetCount]  = pwd;
+    savedNetCount++;
+  }
+  writeAll:
+  prefs.begin("wifi_creds", false);
+  prefs.putInt("count", savedNetCount);
+  for (int i = 0; i < savedNetCount; i++) {
+    prefs.putString(("ssid" + String(i)).c_str(), savedSSIDs[i].c_str());
+    prefs.putString(("pwd"  + String(i)).c_str(), savedPWDs[i].c_str());
+  }
+  prefs.end();
+}
+
+void forgetCredential(String ssid) {
+  int found = -1;
+  for (int i = 0; i < savedNetCount; i++) { if (savedSSIDs[i] == ssid) { found = i; break; } }
+  if (found == -1) return;
+  for (int i = found; i < savedNetCount - 1; i++) {
+    savedSSIDs[i] = savedSSIDs[i + 1];
+    savedPWDs[i]  = savedPWDs[i + 1];
+  }
+  savedNetCount--;
+  prefs.begin("wifi_creds", false);
+  prefs.putInt("count", savedNetCount);
+  for (int i = 0; i < savedNetCount; i++) {
+    prefs.putString(("ssid" + String(i)).c_str(), savedSSIDs[i].c_str());
+    prefs.putString(("pwd"  + String(i)).c_str(), savedPWDs[i].c_str());
+  }
+  prefs.end();
+}
+
+String findSavedPwd(String ssid) {
+  for (int i = 0; i < savedNetCount; i++) { if (savedSSIDs[i] == ssid) return savedPWDs[i]; }
+  return "";
+}
+
+/* ---- NTP sync: stable (non-government) server, up to 3 attempts, then give up ---- */
+
+// Kicks off a sync attempt (or an immediate "no WiFi" failure) and hands off
+// to SCREEN_WIFI_NTP's non-blocking poll (in loop()) to actually finish it.
+// One raw SNTP request/response over UDP (RFC 4330 client mode). Bypasses
+// the OS-level SNTP client entirely -- each of the 4 tasks below owns its own
+// UDP socket and server, fully independent of the others.
+bool ntpQueryOnce(const char* host, uint32_t &outUnixTime, unsigned long timeoutMs) {
+  WiFiUDP udp;
+  if (!udp.begin(0)) return false;
+
+  IPAddress serverIp;
+  if (!WiFi.hostByName(host, serverIp)) { udp.stop(); return false; }
+
+  byte packet[48];
+  memset(packet, 0, 48);
+  packet[0] = 0b11100011; // LI=3 (unsynced), VN=4, Mode=3 (client)
+
+  udp.beginPacket(serverIp, 123);
+  udp.write(packet, 48);
+  udp.endPacket();
+
+  unsigned long start = millis();
+  int size = 0;
+  while (millis() - start < timeoutMs) {
+    size = udp.parsePacket();
+    if (size >= 48) break;
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+  if (size < 48) { udp.stop(); return false; }
+
+  udp.read(packet, 48);
+  udp.stop();
+
+  uint32_t secsSince1900 = ((uint32_t)packet[40] << 24) | ((uint32_t)packet[41] << 16) |
+                            ((uint32_t)packet[42] << 8)  |  (uint32_t)packet[43];
+  const uint32_t SEVENTY_YEARS = 2208988800UL; // 1900 -> 1970 epoch offset
+  outUnixTime = secsSince1900 - SEVENTY_YEARS;
+  return true;
+}
+
+void ntpQueryTask(void *pv) {
+  int slot = (int)(intptr_t)pv;
+  uint32_t epoch = 0;
+  bool ok = ntpQueryOnce(NTP_SERVERS[slot], epoch, NTP_PER_SERVER_TIMEOUT_MS);
+  if (ok) { ntpSlotEpoch[slot] = epoch; ntpSlotOk[slot] = true; }
+  ntpSlotDone[slot] = true;
+  vTaskDelete(NULL);
+}
+
+void startNtpSync() {
+  wifiNtpState = 0;
+  wifiNtpResultMsg = "";
+  wifiNtpBestServer = -1;
+  wifiNtpStart = millis();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    wifiNtpState = 2;
+    wifiNtpResultMsg = "Failed: Internet Issue";
+    wifiNtpDoneAt = millis();
+    return;
+  }
+
+  for (int i = 0; i < NUM_NTP_SERVERS; i++) {
+    ntpSlotDone[i] = false;
+    ntpSlotOk[i] = false;
+    ntpSlotEpoch[i] = 0;
+    xTaskCreate(ntpQueryTask, "NtpQ", 4096, (void*)(intptr_t)i, 1, NULL);
+  }
+}
+
+void drawWifiNTP(int yOffset) {
+  // Deliberately no "<--"/back box anywhere on this screen -- it's fully
+  // automatic (syncs, shows the result, then returns to WiFi Home on its own).
+  display.drawFastHLine(0, 12 + yOffset, 128, SSD1306_WHITE);
+  display.setTextColor(SSD1306_WHITE);
+  drawCenteredText(display, "NTP", 2 + yOffset, 1);
+
+  if (wifiNtpState == 0) {
+    drawCenteredText(display, "Syncing", 30 + yOffset, 1);
+    int dots = ((millis() - wifiNtpStart) / 500) % 4;
+    String dotStr = "";
+    for (int i = 0; i < dots; i++) dotStr += ".";
+    drawCenteredText(display, dotStr, 42 + yOffset, 1);
+  } else {
+    drawCenteredText(display, wifiNtpResultMsg, 28 + yOffset, 1);
+    if (wifiNtpState == 1 && wifiNtpBestServer >= 0) {
+      drawCenteredText(display, NTP_SERVERS[wifiNtpBestServer], 40 + yOffset, 1);
+    }
+  }
+}
+
+void connectivityTask(void *p) {
+  const char* urls[] = {
+    "http://www.gstatic.com/generate_204",
+    "http://clients3.google.com/generate_204",
+    "http://cp.cloudflare.com/generate_204",
+    "http://edge-http.microsoft.com/captiveportal/generate_204",
+    "http://connect.rom.miui.com/generate_204"
+  };
+  int urlIndex = 0;
+  for (;;) {
+    bool ok = false;
+    if (WiFi.status() == WL_CONNECTED) {
+      HTTPClient h;
+      h.setConnectTimeout(1200);
+      h.setTimeout(1800);
+      h.begin(urls[urlIndex]);
+      ok = (h.GET() == 204);
+      h.end();
+    }
+
+    pingerStatus[urlIndex] = ok;
+    urlIndex = (urlIndex + 1) % 5;
+
+    internetOK = pingerStatus[0] || pingerStatus[1] || pingerStatus[2] ||
+                 pingerStatus[3] || pingerStatus[4];
+
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
+
+void startConnectivityPinger() {
+  if (pingerStarted) return;
+  pingerStarted = true;
+  xTaskCreate(connectivityTask, "NetPing", 4096, NULL, 1, NULL);
+}
+
+void drawWifiStatusIcon(int x, int y) {
+  display.drawBitmap(x, y, wifi_bmp, 8, 8, SSD1306_WHITE);
+}
+
+void drawTowerStatusIcon(int x, int y) {
+  display.drawBitmap(x, y, tower_bmp, 8, 8, SSD1306_WHITE);
+}
+
+void enterDeepSleep() {
+  if (displayOn) {
+    display.ssd1306_command(SSD1306_DISPLAYOFF);
+    displayOn = false;
+  }
+
+  // WiFi is only ever on because the user explicitly turned it on, and it
+  // never survives deep sleep anyway (the whole chip powers down) -- force it
+  // off cleanly rather than leaving the radio in an undefined state. It stays
+  // off on wake too; nothing here re-enables it automatically.
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+
+  // CENTER is active-low (pressed = LOW), and it's the only button in the
+  // LP domain -- see the DEEP_SLEEP_TIMEOUT_MS comment for why.
+  esp_deep_sleep_enable_gpio_wakeup(1ULL << BTN_CENTER, ESP_GPIO_WAKEUP_GPIO_LOW);
+  esp_deep_sleep_start(); // never returns -- wake re-runs setup() from scratch
+}
 
 void setup() {
   Serial.begin(115200);
@@ -336,6 +1015,8 @@ void setup() {
   }
 
   setupButtons();
+
+  xTaskCreate(batteryAdcTask, "BatteryADC", 2048, NULL, 1, NULL);
 
   Wire.begin(PIN_SDA, PIN_SCL);
   Wire.setClock(I2C_CLOCK_DISPLAY); // 1MHz -- gives ~2.6x headroom over the 40 FPS OLED requirement
@@ -375,6 +1056,7 @@ void setup() {
 
   loadSettings();
   rwLoadFromFile();
+  loadCredentials(); // saved WiFi SSID/password pairs -- WiFi itself stays off until asked
 
   lastActivityTime = millis();
 }
@@ -397,19 +1079,14 @@ void loop() {
       animOffsetY = 0;
       isAnimating = false;
 
-      // Terminal and Restwise read Serial only while they're the active screen,
-      // so waking must never bounce out of them (that would silently drop any
-      // command/payload sent while the panel was blanked). For every other
-      // screen: at night, greet with Good Night; otherwise snap to the
-      // watchface when a PIN is set (so the lock gate re-triggers), else resume
-      // whatever screen you were on.
-      bool inSerialApp = (currentScreen == SCREEN_TERMINAL ||
-                          currentScreen == SCREEN_RESTWISE ||
-                          currentScreen == SCREEN_RESTWISE_DAY);
-      if (!inSerialApp) {
-        if (isNightNow()) currentScreen = SCREEN_GOODNIGHT;
-        else if (pinSet)  currentScreen = SCREEN_WATCHFACE;
-      }
+      // Every wake -- from idle blanking or deep sleep alike -- always lands
+      // on the watchface, except during configured night hours, when it
+      // shows the Good Night greeting instead. A real Restwise sync still
+      // finds its way back to the Restwise screen on its own the moment
+      // traffic arrives (that handshake navigates there regardless of
+      // currentScreen), so this doesn't drop an in-progress sync -- it just
+      // stops resuming whatever screen you happened to be sitting on before.
+      currentScreen = isNightNow() ? SCREEN_GOODNIGHT : SCREEN_WATCHFACE;
 
       for (int i = 0; i < 5; i++) buttonJustPressed[i] = false;
     }
@@ -430,7 +1107,10 @@ void loop() {
   // Idle blanking runs on every screen the user might be sitting on. The single
   // exception is animations -- blanking mid-slide would strand the transition
   // halfway. This gives the Lock Screen timeout its intended global effect.
-  bool allowBlank = !isAnimating && currentScreen != SCREEN_ANIMATOR;
+  bool allowBlank = !isAnimating && currentScreen != SCREEN_ANIMATOR &&
+                     currentScreen != SCREEN_WIFI_SCANNING &&
+                     currentScreen != SCREEN_WIFI_PASSWORD &&
+                     currentScreen != SCREEN_WIFI_NTP;
 
   if (displayOn && allowBlank) {
     if (millis() - lastActivityTime > DISPLAY_TIMEOUT_MS) {
@@ -443,6 +1123,23 @@ void loop() {
       display.ssd1306_command(SSD1306_DISPLAYON);
       displayOn = true;
       lastActivityTime = millis();
+  }
+
+  // Deep sleep after DEEP_SLEEP_TIMEOUT_MS of true inactivity -- but never
+  // while something active is running that a full reset would silently kill:
+  // a live Stopwatch/Timer, a mid-transfer Restwise sync, an in-progress
+  // slide, the Animator (a passive but deliberately continuous screen), or a
+  // WiFi scan/password-entry/connect/NTP-sync in flight. Otherwise WiFi is
+  // free to keep running through an ordinary display-off idle blank -- only
+  // deep sleep forces it off.
+  bool allowDeepSleep = !isAnimating && currentScreen != SCREEN_ANIMATOR &&
+                        !swRunning && tmMode != TM_RUNNING &&
+                        rwSyncState != RWS_RECV &&
+                        currentScreen != SCREEN_WIFI_SCANNING &&
+                        currentScreen != SCREEN_WIFI_PASSWORD &&
+                        currentScreen != SCREEN_WIFI_NTP;
+  if (allowDeepSleep && millis() - lastActivityTime > DEEP_SLEEP_TIMEOUT_MS) {
+    enterDeepSleep();
   }
 
   // The timer countdown must keep ticking even while the display is blanked
@@ -514,6 +1211,23 @@ void loop() {
             animatorSceneStart = millis();
             startAnimation(SCREEN_ANIMATOR, -64);
           } else if (menuIndex == 5) {
+            startAnimation(SCREEN_BATTERY, -64);
+          } else if (menuIndex == 6) {
+            if (WiFi.status() == WL_CONNECTED) {
+              wifiHomeCursor = 0;
+              startAnimation(SCREEN_WIFI_HOME, -64);
+            } else if (wifiEnabled) {
+              WiFi.scanDelete(); WiFi.disconnect();
+              delay(100);
+              WiFi.scanNetworks(true, false, false, 250);
+              wifiScanStart = millis();
+              wifiScanResults = -1;
+              startAnimation(SCREEN_WIFI_SCANNING, -64);
+            } else {
+              wifiConfirmCursor = 0;
+              startAnimation(SCREEN_WIFI_CONFIRM, -64);
+            }
+          } else if (menuIndex == 7) {
             if (pinSet) {
               pendingAction = ACT_OPEN_MENU;
               enterPinScreen(SEC_VERIFY, SCREEN_MENU);
@@ -522,17 +1236,187 @@ void loop() {
               confirmSelection = 0;
               startAnimation(SCREEN_SECURITY_CONFIRM, -64);
             }
-          } else if (menuIndex == 6) {
+          } else if (menuIndex == 8) {
             lockSettingsCursor = -1;
             for (int i = 0; i < 4; i++) if (lockTimeoutOptions[i] == displayTimeoutSec) lockSettingsCursor = i;
             if (lockSettingsCursor == -1) lockSettingsCursor = 0;
             startAnimation(SCREEN_LOCK_SETTINGS, -64);
-          } else if (menuIndex == 7) {
+          } else if (menuIndex == 9) {
             termState = TERM_IDLE;
             termLineBuf = "";
             startAnimation(SCREEN_TERMINAL, -64);
-          } else if (menuIndex == 8) {
+          } else if (menuIndex == 10) {
             startAnimation(SCREEN_WATCHFACE, 64);
+          }
+        }
+      }
+      else if (currentScreen == SCREEN_BATTERY) {
+        // Passive read-only screen -- the back box is always focused, CENTER exits.
+        if (buttonJustPressed[4]) {
+          startAnimation(SCREEN_MENU, 64);
+        }
+      }
+      else if (currentScreen == SCREEN_WIFI_CONFIRM) {
+        if (buttonJustPressed[0]) wifiConfirmCursor = -1;
+        if (buttonJustPressed[1] && wifiConfirmCursor == -1) wifiConfirmCursor = 0;
+        if (buttonJustPressed[3]) wifiConfirmCursor = 1;
+        if (buttonJustPressed[2] && wifiConfirmCursor == 1) wifiConfirmCursor = 0;
+        if (buttonJustPressed[4]) {
+          if (wifiConfirmCursor == 0) {
+            if (WIFI_APP_ENABLED) {
+              wifiEnabled = true; wifiStatusMsg = ""; wifiRetryCount = 0;
+              WiFi.mode(WIFI_STA); WiFi.scanDelete();
+              WiFi.disconnect(); delay(100);
+              WiFi.scanNetworks(true);
+              wifiScanStart = millis(); wifiScanResults = -1;
+              startAnimation(SCREEN_WIFI_SCANNING, -64);
+            }
+          } else {
+            startAnimation(SCREEN_MENU, 64);
+          }
+        }
+      }
+      else if (currentScreen == SCREEN_WIFI_RESULTS) {
+        if (buttonJustPressed[0]) { if (wifiListIndex > -1) wifiListIndex--; }
+        if (buttonJustPressed[1]) { if (wifiListIndex < wifiScanResults - 1) wifiListIndex++; }
+        if (buttonJustPressed[2]) { if (wifiListIndex == -1) wifiListIndex = 0; }
+        if (buttonJustPressed[4]) {
+          if (wifiListIndex == -1) { WiFi.disconnect(); startAnimation(SCREEN_MENU, 64); }
+          else {
+            wifiTargetSSID  = WiFi.SSID(wifiListIndex);
+            wifiPassword    = findSavedPwd(wifiTargetSSID); // autofill from a previous connection
+            kbInputBuffer   = wifiPassword;
+            wifiStatusMsg   = "";
+            wifiRetryCount  = 0;
+            wifiPasswordCursor = -1;
+            startAnimation(SCREEN_WIFI_PASSWORD, -64);
+          }
+        }
+      }
+      else if (currentScreen == SCREEN_WIFI_PASSWORD) {
+        if (buttonJustPressed[0]) {
+          if (wifiPasswordCursor == 0 || wifiPasswordCursor == 1) wifiPasswordCursor = -1;
+        }
+        if (buttonJustPressed[1]) { if (wifiPasswordCursor == -1) wifiPasswordCursor = 0; }
+        if (buttonJustPressed[2]) { if (wifiPasswordCursor == 1) wifiPasswordCursor = 0; }
+        if (buttonJustPressed[3]) { if (wifiPasswordCursor == 0) wifiPasswordCursor = 1; }
+        if (buttonJustPressed[4]) {
+          if (wifiPasswordCursor == -1) { WiFi.disconnect(); startAnimation(SCREEN_WIFI_RESULTS, 64); }
+          else if (wifiPasswordCursor == 0) {
+            kbInputBuffer = wifiPassword; currentKBMode = KB_LOWER;
+            kbCursorRow = 0; kbCursorCol = 0;
+            kbTextCursor   = kbInputBuffer.length();
+            kbScrollOffset = 0;
+            kbReturnScreen = SCREEN_WIFI_PASSWORD;
+            currentScreen  = SCREEN_WIFI_KEYBOARD;
+          } else if (wifiPasswordCursor == 1) {
+            WiFi.begin(wifiTargetSSID.c_str(), wifiPassword.c_str());
+            wifiConnecting = true;
+            wifiConnectStartTime = millis();
+            wifiStatusMsg = "Connecting...";
+          }
+        }
+
+        if (wifiConnecting) {
+          lastActivityTime = millis();
+          if (WiFi.status() == WL_CONNECTED) {
+            wifiConnecting = false; wifiRetryCount = 0;
+            saveCredential(wifiTargetSSID, wifiPassword);
+            lastConnectedSSID = wifiTargetSSID;
+            startConnectivityPinger(); // internet-reachability icon; NTP is now manual-only (WiFi Home -> NTP Sync)
+            wifiHomeCursor = 0;
+            startAnimation(SCREEN_WIFI_HOME, -64);
+          } else if (WiFi.status() == WL_CONNECT_FAILED) {
+            wifiConnecting = false; wifiRetryCount++;
+            WiFi.disconnect();
+            wifiStatusMsg = (wifiRetryCount >= 5) ? "Check signal/pass" : "Failed! Wrong PW?";
+          } else if (millis() - wifiConnectStartTime > 15000) {
+            wifiConnecting = false; wifiRetryCount++;
+            WiFi.disconnect();
+            wifiStatusMsg = (wifiRetryCount >= 5) ? "Check Router dist." : "Try Again...";
+          }
+        }
+      }
+      else if (currentScreen == SCREEN_WIFI_KEYBOARD) {
+        if (buttonJustPressed[0]) { if (kbCursorRow > 0) kbCursorRow--; }
+        if (buttonJustPressed[1]) { if (kbCursorRow < 3) kbCursorRow++; }
+        if (buttonJustPressed[2]) { kbCursorCol = (kbCursorCol > 0) ? kbCursorCol - 1 : 10; }
+        if (buttonJustPressed[3]) { kbCursorCol = (kbCursorCol < 10) ? kbCursorCol + 1 : 0; }
+        if (buttonJustPressed[4]) {
+          const char* key;
+          if (currentKBMode == KB_UPPER) key = kbUpper[kbCursorRow][kbCursorCol];
+          else if (currentKBMode == KB_SYMBOL) key = kbSymbol[kbCursorRow][kbCursorCol];
+          else key = kbLower[kbCursorRow][kbCursorCol];
+
+          if (strcmp(key, "EN") == 0) {
+            wifiPassword = kbInputBuffer;
+            currentScreen = kbReturnScreen;
+          } else if (strcmp(key, "CL") == 0) {
+            if (kbTextCursor > 0) kbTextCursor--;
+          } else if (strcmp(key, "CR") == 0) {
+            if (kbTextCursor < (int)kbInputBuffer.length()) kbTextCursor++;
+          } else if (strcmp(key, "<") == 0 && currentKBMode != KB_SYMBOL) {
+            if (kbTextCursor > 0) kbTextCursor--;
+          } else if (strcmp(key, ">") == 0 && currentKBMode != KB_SYMBOL) {
+            if (kbTextCursor < (int)kbInputBuffer.length()) kbTextCursor++;
+          } else if (strcmp(key, "BS") == 0) {
+            if (kbTextCursor > 0 && kbInputBuffer.length() > 0) {
+              kbInputBuffer.remove(kbTextCursor - 1, 1);
+              kbTextCursor--;
+            }
+          } else if (strcmp(key, "^") == 0) {
+            if (currentKBMode == KB_LOWER) currentKBMode = KB_UPPER;
+            else if (currentKBMode == KB_UPPER) currentKBMode = KB_SYMBOL;
+            else currentKBMode = KB_LOWER;
+          } else {
+            kbInputBuffer = kbInputBuffer.substring(0, kbTextCursor) + String(key) + kbInputBuffer.substring(kbTextCursor);
+            kbTextCursor += String(key).length();
+          }
+        }
+      }
+      else if (currentScreen == SCREEN_WIFI_HOME) {
+        if (buttonJustPressed[0]) { if (wifiHomeCursor > -1) wifiHomeCursor--; }
+        if (buttonJustPressed[1]) { if (wifiHomeCursor < 2) wifiHomeCursor++; }
+        if (buttonJustPressed[2]) { if (wifiHomeCursor == -1) wifiHomeCursor = 0; }
+        if (buttonJustPressed[4]) {
+          if (wifiHomeCursor == -1) startAnimation(SCREEN_MENU, 64);
+          else if (wifiHomeCursor == 0) { wifiToggleCursor = 1; startAnimation(SCREEN_WIFI_TOGGLE_CONFIRM, -64); }
+          else if (wifiHomeCursor == 1) {
+            wifiForgetTargetSSID = WiFi.SSID();
+            wifiForgetCursor = 1;
+            startAnimation(SCREEN_WIFI_FORGET_CONFIRM, -64);
+          }
+          else if (wifiHomeCursor == 2) {
+            startNtpSync();
+            startAnimation(SCREEN_WIFI_NTP, -64);
+          }
+        }
+      }
+      else if (currentScreen == SCREEN_WIFI_TOGGLE_CONFIRM) {
+        if (buttonJustPressed[2]) wifiToggleCursor = 0;
+        if (buttonJustPressed[3]) wifiToggleCursor = 1;
+        if (buttonJustPressed[4]) {
+          if (wifiToggleCursor == 0) {
+            wifiEnabled = false;
+            WiFi.disconnect(true);
+            WiFi.mode(WIFI_OFF);
+            startAnimation(SCREEN_MENU, 64);
+          } else {
+            startAnimation(SCREEN_WIFI_HOME, 64);
+          }
+        }
+      }
+      else if (currentScreen == SCREEN_WIFI_FORGET_CONFIRM) {
+        if (buttonJustPressed[2]) wifiForgetCursor = 0;
+        if (buttonJustPressed[3]) wifiForgetCursor = 1;
+        if (buttonJustPressed[4]) {
+          if (wifiForgetCursor == 0) {
+            forgetCredential(wifiForgetTargetSSID);
+            if (lastConnectedSSID == wifiForgetTargetSSID) lastConnectedSSID = "";
+            WiFi.disconnect();
+            startAnimation(SCREEN_MENU, 64);
+          } else {
+            startAnimation(SCREEN_WIFI_HOME, 64);
           }
         }
       }
@@ -974,6 +1858,71 @@ void loop() {
     }
   }
 
+  // ---- WiFi scan polling (async scanNetworks(), same pattern as AIO_Transmitter) ----
+  if (currentScreen == SCREEN_WIFI_SCANNING && !isAnimating) {
+    lastActivityTime = millis();
+    int result = WiFi.scanComplete();
+    static bool scanRetried = false;
+    if (result >= 0) {
+      wifiScanResults = result;
+      wifiListIndex = 0; wifiListScroll = 0;
+      startAnimation(SCREEN_WIFI_RESULTS, -64);
+      scanRetried = false;
+    } else if (result == WIFI_SCAN_FAILED) {
+      if (!scanRetried) {
+        scanRetried = true;
+        WiFi.scanNetworks(true, false, false, 80);
+      } else {
+        wifiScanResults = 0;
+        startAnimation(SCREEN_WIFI_RESULTS, -64);
+        scanRetried = false;
+      }
+    } else if (millis() - wifiScanStart > 8000) {
+      WiFi.scanDelete();
+      wifiScanResults = 0;
+      startAnimation(SCREEN_WIFI_RESULTS, -64);
+      scanRetried = false;
+    }
+  }
+
+  // ---- NTP sync polling -- non-blocking. The 4 query tasks run independently
+  // in the background; this just checks in on them each loop tick. Waits for
+  // either all 4 to finish or the 20s budget to expire, then picks the
+  // highest-priority (lowest index) server among whichever succeeded -- this
+  // is what makes "if more than one returns, higher priority wins" correct,
+  // rather than just racing to whichever task happens to finish first. ----
+  if (currentScreen == SCREEN_WIFI_NTP && !isAnimating) {
+    lastActivityTime = millis();
+    if (wifiNtpState == 0) {
+      bool allDone = ntpSlotDone[0] && ntpSlotDone[1] && ntpSlotDone[2] && ntpSlotDone[3];
+      bool timedOut = millis() - wifiNtpStart > NTP_TIMEOUT_MS;
+      if (allDone || timedOut) {
+        int best = -1;
+        for (int i = 0; i < NUM_NTP_SERVERS; i++) {
+          if (ntpSlotOk[i]) { best = i; break; } // index 0 = highest priority
+        }
+        wifiNtpBestServer = best;
+        if (best >= 0) {
+          time_t t = (time_t)(ntpSlotEpoch[best] + NTP_GMT_OFFSET_SEC);
+          struct tm ti;
+          gmtime_r(&t, &ti);
+          DateTime ntpTime(ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday, ti.tm_hour, ti.tm_min, ti.tm_sec);
+          setDeviceTime(ntpTime);
+          char buf[32];
+          sprintf(buf, "Synced to %02d:%02d", ti.tm_hour, ti.tm_min);
+          wifiNtpResultMsg = String(buf);
+          wifiNtpState = 1;
+        } else {
+          wifiNtpResultMsg = "Failed: Timeout Error";
+          wifiNtpState = 2;
+        }
+        wifiNtpDoneAt = millis();
+      }
+    } else if (millis() - wifiNtpDoneAt > NTP_RESULT_HOLD_MS) {
+      startAnimation(SCREEN_WIFI_HOME, 64);
+    }
+  }
+
   delay(5);
 }
 
@@ -1107,6 +2056,16 @@ void drawScreen(ScreenState screen, int yOffset) {
   else if (screen == SCREEN_RESTWISE_DAY) drawRestwiseDay(yOffset);
   else if (screen == SCREEN_GOODNIGHT) drawGoodNight(yOffset);
   else if (screen == SCREEN_ANIMATOR) drawAnimator(yOffset);
+  else if (screen == SCREEN_BATTERY) drawBattery(yOffset);
+  else if (screen == SCREEN_WIFI_CONFIRM) drawWifiConfirm(yOffset);
+  else if (screen == SCREEN_WIFI_SCANNING) drawWifiScanning(yOffset);
+  else if (screen == SCREEN_WIFI_RESULTS) drawWifiResults(yOffset);
+  else if (screen == SCREEN_WIFI_PASSWORD) drawWifiPassword(yOffset);
+  else if (screen == SCREEN_WIFI_KEYBOARD) drawWifiKeyboard();
+  else if (screen == SCREEN_WIFI_HOME) drawWifiHome(yOffset);
+  else if (screen == SCREEN_WIFI_TOGGLE_CONFIRM) drawWifiToggleConfirm(yOffset);
+  else if (screen == SCREEN_WIFI_FORGET_CONFIRM) drawWifiForgetConfirm(yOffset);
+  else if (screen == SCREEN_WIFI_NTP) drawWifiNTP(yOffset);
 }
 
 void drawHeader(int yOffset, const char* appName, bool backFocused) {
@@ -1144,6 +2103,9 @@ void drawHeader(int yOffset, const char* appName, bool backFocused) {
 void drawWatchFace(int yOffset) {
 
   drawHeader(yOffset);
+  drawBatteryIcon(128 - 18, 2 + yOffset);
+  if (WiFi.status() == WL_CONNECTED) drawWifiStatusIcon(2, 2 + yOffset);
+  if (internetOK) drawTowerStatusIcon(12, 2 + yOffset);
 
   DateTime now = nowTime();
   uint16_t hour = now.hour();
