@@ -1054,8 +1054,8 @@ const uint8_t cactusL3[] PROGMEM = {
 
 const int DINO_W = 18, DINO_H = 19, DINO_X = 10;
 const int DINO_FEET_Y = 61; // last pixel row of every sprite; the horizon line is drawn on row 62
-const float DINO_GRAVITY = 725.0f;  // px/s^2
-const float DINO_JUMP_V = 201.6f;   // px/s -> ~28px apex, ~0.56s airtime
+const float DINO_GRAVITY = 906.25f; // px/s^2
+const float DINO_JUMP_V = 252.0f;   // px/s -> ~35px apex, ~0.56s airtime
 const float DINO_AIR_TIME = 2.0f * DINO_JUMP_V / DINO_GRAVITY;
 const float DINO_SPEED_START = 100.0f; // px/s
 const float DINO_SPEED_MAX = 190.0f;
@@ -1335,7 +1335,13 @@ void drawDino(int yOffset) {
   else if (dinoState == DINO_READY) spr = ((millis() / 150) % 12 == 0) ? dinoBlink : dinoStand;
   else if (dinoY > 0.0f) spr = dinoStand;
   else spr = (((int)(dinoRunSec * 12.0f)) & 1) ? dinoRun2 : dinoRun1;
-  display.drawBitmap(DINO_X, DINO_FEET_Y - DINO_H + 1 - (int)(dinoY + 0.5f) + yOffset, spr, DINO_W, DINO_H, SSD1306_WHITE);
+  // The apex reaches into the header bar, so draw row by row and skip rows above the header line.
+  int dinoTop = DINO_FEET_Y - DINO_H + 1 - (int)(dinoY + 0.5f) + yOffset;
+  const int bytesPerRow = (DINO_W + 7) / 8;
+  for (int r = 0; r < DINO_H; r++) {
+    if (dinoTop + r <= 12 + yOffset) continue;
+    display.drawBitmap(DINO_X, dinoTop + r, spr + r * bytesPerRow, DINO_W, 1, SSD1306_WHITE);
+  }
 
   if (dinoState == DINO_READY) {
     drawCenteredText(display, "Press UP to start", 22 + yOffset, 1);
