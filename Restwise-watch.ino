@@ -63,12 +63,11 @@
   #error "Missing ai_config.h - copy ai_config.example.h to ai_config.h and add your Groq API key."
 #endif
 
-// Master switch for the WiFi app/feature. Flip to false to hard-block the
-// radio from ever being enabled (even if the UI is still reachable) without
-// ripping the feature out -- useful for a strict "radio-off" competition
-// build. Does NOT affect the boot-time WiFi.mode(WIFI_OFF)/btStop() below --
-// the watch is always radio-off at boot regardless; this only gates whether
-// the WiFi app is allowed to actually turn the radio on when asked to.
+// Master switch for the "extras" that exist on the dev watch but should not
+// ship: the WiFi app (false hard-blocks the radio from ever being enabled,
+// even if the UI is reachable) and the Dino Game (false hides it from the
+// Apps menu). Does NOT affect the boot-time WiFi.mode(WIFI_OFF)/btStop()
+// below -- the watch is always radio-off at boot regardless.
 const bool WIFI_APP_ENABLED = true;
 
 #define SCREEN_WIDTH 128
@@ -128,7 +127,7 @@ enum ScreenState {
   SCREEN_PIN_ENTRY, SCREEN_SECURITY_MENU, SCREEN_SECURITY_CONFIRM,
   SCREEN_LOCK_SETTINGS, SCREEN_TERMINAL,
   SCREEN_RESTWISE, SCREEN_RESTWISE_DAY, SCREEN_GOODNIGHT,
-  SCREEN_ANIMATOR, SCREEN_BATTERY, SCREEN_BATTERY_INDICATOR,
+  SCREEN_ANIMATOR, SCREEN_BATTERY, SCREEN_BATTERY_INDICATOR, SCREEN_DINO,
   SCREEN_WIFI_CONFIRM, SCREEN_WIFI_SCANNING, SCREEN_WIFI_RESULTS,
   SCREEN_WIFI_PASSWORD, SCREEN_WIFI_KEYBOARD, SCREEN_WIFI_HOME,
   SCREEN_WIFI_TOGGLE_CONFIRM, SCREEN_WIFI_FORGET_CONFIRM, SCREEN_WIFI_NTP,
@@ -139,9 +138,23 @@ ScreenState currentScreen = SCREEN_WATCHFACE;
 bool lastButtonStates[5] = {false, false, false, false, false};
 bool buttonJustPressed[5] = {false, false, false, false, false};
 
-const int NUM_MENU_ITEMS = 12;
-const char* menuItems[NUM_MENU_ITEMS] = {"Restwise", "Stopwatch", "Timer", "Calculator", "Animator", "Battery", "WiFi", "AI Chatbot", "Security", "Lock Screen", "Terminal", "Lock"};
+enum MenuApp {
+  APP_RESTWISE, APP_STOPWATCH, APP_TIMER, APP_CALCULATOR, APP_ANIMATOR, APP_BATTERY,
+  APP_WIFI, APP_AI, APP_DINO, APP_SECURITY, APP_LOCKSCREEN, APP_TERMINAL, APP_LOCK,
+  NUM_MENU_APPS
+};
+const char* const menuAppNames[NUM_MENU_APPS] = {"Restwise", "Stopwatch", "Timer", "Calculator", "Animator", "Battery", "WiFi", "AI Chatbot", "Dino Game", "Security", "Lock Screen", "Terminal", "Lock"};
+int menuApps[NUM_MENU_APPS]; // visible menu rows -> MenuApp, built once in buildMenu()
+int menuCount = 0;
 int menuIndex = 0;
+
+void buildMenu() {
+  menuCount = 0;
+  for (int a = 0; a < NUM_MENU_APPS; a++) {
+    if (a == APP_DINO && !WIFI_APP_ENABLED) continue;
+    menuApps[menuCount++] = a;
+  }
+}
 
 unsigned long swStartTime = 0;
 unsigned long swElapsedTime = 0;
@@ -784,6 +797,563 @@ void saveBatterySettings() {
   prefs.begin("batt_set", false);
   prefs.putBool("pct", battShowPercent);
   prefs.end();
+}
+
+/* ---------------------------- Dino game ---------------------------- */
+// Sprites: Chromium's own T-Rex/cactus art, body-cropped and downsampled 0.45x for the OLED.
+
+// dinoStand: 18x19
+const uint8_t dinoStand[] PROGMEM = {
+  0x00, 0x3f, 0x80,   //           #######
+  0x00, 0x6f, 0xc0,   //          ## ######
+  0x00, 0x7f, 0xc0,   //          #########
+  0x00, 0x7f, 0xc0,   //          #########
+  0x00, 0x7f, 0xc0,   //          #########
+  0x00, 0x7c, 0x00,   //          #####
+  0x00, 0x7f, 0x00,   //          #######
+  0x81, 0xf8, 0x00,   // #      ######
+  0xc3, 0xfc, 0x00,   // ##    ########
+  0xe7, 0xfc, 0x00,   // ###  #########
+  0xff, 0xf8, 0x00,   // #############
+  0xff, 0xf8, 0x00,   // #############
+  0x7f, 0xf0, 0x00,   //  ###########
+  0x3f, 0xf0, 0x00,   //   ##########
+  0x1f, 0xe0, 0x00,   //    ########
+  0x0f, 0xc0, 0x00,   //     ######
+  0x0c, 0x60, 0x00,   //     ##   ##
+  0x0c, 0x60, 0x00,   //     ##   ##
+  0x0e, 0x70, 0x00,   //     ###  ###
+};
+
+// dinoBlink: 18x19
+const uint8_t dinoBlink[] PROGMEM = {
+  0x00, 0x3f, 0x80,   //           #######
+  0x00, 0x7f, 0xc0,   //          #########
+  0x00, 0x7f, 0xc0,   //          #########
+  0x00, 0x7f, 0xc0,   //          #########
+  0x00, 0x7f, 0xc0,   //          #########
+  0x00, 0x7c, 0x00,   //          #####
+  0x00, 0x7f, 0x00,   //          #######
+  0x81, 0xf8, 0x00,   // #      ######
+  0xc3, 0xfc, 0x00,   // ##    ########
+  0xe7, 0xfc, 0x00,   // ###  #########
+  0xff, 0xf8, 0x00,   // #############
+  0xff, 0xf8, 0x00,   // #############
+  0x7f, 0xf0, 0x00,   //  ###########
+  0x3f, 0xf0, 0x00,   //   ##########
+  0x1f, 0xe0, 0x00,   //    ########
+  0x0f, 0xc0, 0x00,   //     ######
+  0x0c, 0x60, 0x00,   //     ##   ##
+  0x0c, 0x60, 0x00,   //     ##   ##
+  0x0e, 0x70, 0x00,   //     ###  ###
+};
+
+// dinoRun1: 18x19
+const uint8_t dinoRun1[] PROGMEM = {
+  0x00, 0x3f, 0x80,   //           #######
+  0x00, 0x6f, 0xc0,   //          ## ######
+  0x00, 0x7f, 0xc0,   //          #########
+  0x00, 0x7f, 0xc0,   //          #########
+  0x00, 0x7f, 0xc0,   //          #########
+  0x00, 0x7c, 0x00,   //          #####
+  0x00, 0x7f, 0x00,   //          #######
+  0x81, 0xf8, 0x00,   // #      ######
+  0xc3, 0xfc, 0x00,   // ##    ########
+  0xe7, 0xfc, 0x00,   // ###  #########
+  0xff, 0xf8, 0x00,   // #############
+  0xff, 0xf8, 0x00,   // #############
+  0x7f, 0xf0, 0x00,   //  ###########
+  0x3f, 0xf0, 0x00,   //   ##########
+  0x1f, 0xe0, 0x00,   //    ########
+  0x0f, 0xc0, 0x00,   //     ######
+  0x0c, 0x60, 0x00,   //     ##   ##
+  0x0c, 0x00, 0x00,   //     ##
+  0x0e, 0x00, 0x00,   //     ###
+};
+
+// dinoRun2: 18x19
+const uint8_t dinoRun2[] PROGMEM = {
+  0x00, 0x3f, 0x80,   //           #######
+  0x00, 0x6f, 0xc0,   //          ## ######
+  0x00, 0x7f, 0xc0,   //          #########
+  0x00, 0x7f, 0xc0,   //          #########
+  0x00, 0x7f, 0xc0,   //          #########
+  0x00, 0x7c, 0x00,   //          #####
+  0x00, 0x7f, 0x00,   //          #######
+  0x81, 0xf8, 0x00,   // #      ######
+  0xc3, 0xfc, 0x00,   // ##    ########
+  0xe7, 0xfc, 0x00,   // ###  #########
+  0xff, 0xf8, 0x00,   // #############
+  0xff, 0xf8, 0x00,   // #############
+  0x7f, 0xf0, 0x00,   //  ###########
+  0x3f, 0xf0, 0x00,   //   ##########
+  0x1f, 0xe0, 0x00,   //    ########
+  0x0f, 0xc0, 0x00,   //     ######
+  0x0c, 0x60, 0x00,   //     ##   ##
+  0x00, 0x60, 0x00,   //          ##
+  0x00, 0x70, 0x00,   //          ###
+};
+
+// dinoDead: 18x19
+const uint8_t dinoDead[] PROGMEM = {
+  0x00, 0x3f, 0x80,   //           #######
+  0x00, 0x57, 0xc0,   //          # # #####
+  0x00, 0x6f, 0xc0,   //          ## ######
+  0x00, 0x57, 0xc0,   //          # # #####
+  0x00, 0x7f, 0xc0,   //          #########
+  0x00, 0x7c, 0x00,   //          #####
+  0x00, 0x7f, 0x00,   //          #######
+  0x81, 0xf8, 0x00,   // #      ######
+  0xc3, 0xfc, 0x00,   // ##    ########
+  0xe7, 0xfc, 0x00,   // ###  #########
+  0xff, 0xf8, 0x00,   // #############
+  0xff, 0xf8, 0x00,   // #############
+  0x7f, 0xf0, 0x00,   //  ###########
+  0x3f, 0xf0, 0x00,   //   ##########
+  0x1f, 0xe0, 0x00,   //    ########
+  0x0f, 0xc0, 0x00,   //     ######
+  0x0c, 0x60, 0x00,   //     ##   ##
+  0x0c, 0x60, 0x00,   //     ##   ##
+  0x0e, 0x70, 0x00,   //     ###  ###
+};
+
+// cactusS1: 7x15
+const uint8_t cactusS1[] PROGMEM = {
+  0x38,   //   ###
+  0x38,   //   ###
+  0x3a,   //   ### #
+  0x3a,   //   ### #
+  0xba,   // # ### #
+  0xba,   // # ### #
+  0xbe,   // # #####
+  0xbe,   // # #####
+  0xf8,   // #####
+  0x78,   //  ####
+  0x38,   //   ###
+  0x38,   //   ###
+  0x38,   //   ###
+  0x38,   //   ###
+  0x38,   //   ###
+};
+
+// cactusS2: 14x15
+const uint8_t cactusS2[] PROGMEM = {
+  0x30, 0x30,   //   ##      ##
+  0x30, 0x30,   //   ##      ##
+  0x37, 0xf4,   //   ## ####### #
+  0x37, 0xf4,   //   ## ####### #
+  0xb7, 0xf4,   // # ## ####### #
+  0xb7, 0xf4,   // # ## ####### #
+  0xbe, 0xf4,   // # ##### #### #
+  0xbc, 0x7c,   // # ####   #####
+  0xf8, 0x3c,   // #####     ####
+  0x70, 0x30,   //  ###      ##
+  0x30, 0x30,   //   ##      ##
+  0x30, 0x30,   //   ##      ##
+  0x30, 0x30,   //   ##      ##
+  0x30, 0x30,   //   ##      ##
+  0x30, 0x30,   //   ##      ##
+};
+
+// cactusS3: 22x15
+const uint8_t cactusS3[] PROGMEM = {
+  0x30, 0x30, 0x30,   //   ##      ##      ##
+  0x38, 0x30, 0x70,   //   ###     ##     ###
+  0x3e, 0xb1, 0xf4,   //   ##### # ##   ##### #
+  0x3e, 0xb5, 0xf4,   //   ##### # ## # ##### #
+  0xbe, 0xb5, 0xf4,   // # ##### # ## # ##### #
+  0xbe, 0xb5, 0xf4,   // # ##### # ## # ##### #
+  0xbe, 0xb5, 0xf4,   // # ##### # ## # ##### #
+  0xbc, 0xb4, 0xfc,   // # ####  # ## #  ######
+  0xf8, 0xb4, 0x7c,   // #####   # ## #   #####
+  0x78, 0xf4, 0x70,   //  ####   #### #   ###
+  0x38, 0x7c, 0x70,   //   ###    #####   ###
+  0x38, 0x38, 0x70,   //   ###     ###    ###
+  0x38, 0x30, 0x70,   //   ###     ##     ###
+  0x38, 0x30, 0x70,   //   ###     ##     ###
+  0x38, 0x30, 0x70,   //   ###     ##     ###
+};
+
+// cactusL1: 10x22
+const uint8_t cactusL1[] PROGMEM = {
+  0x0c, 0x00,   //     ##
+  0x1e, 0x00,   //    ####
+  0x1e, 0x00,   //    ####
+  0x1e, 0x00,   //    ####
+  0x1e, 0x00,   //    ####
+  0x1e, 0xc0,   //    #### ##
+  0xde, 0xc0,   // ## #### ##
+  0xde, 0xc0,   // ## #### ##
+  0xde, 0xc0,   // ## #### ##
+  0xde, 0xc0,   // ## #### ##
+  0xde, 0xc0,   // ## #### ##
+  0xde, 0xc0,   // ## #### ##
+  0xff, 0x80,   // #########
+  0x7f, 0x00,   //  #######
+  0x1e, 0x00,   //    ####
+  0x1e, 0x00,   //    ####
+  0x1e, 0x00,   //    ####
+  0x1e, 0x00,   //    ####
+  0x1e, 0x00,   //    ####
+  0x1e, 0x00,   //    ####
+  0x1e, 0x00,   //    ####
+  0x1e, 0x00,   //    ####
+};
+
+// cactusL2: 22x22
+const uint8_t cactusL2[] PROGMEM = {
+  0x0e, 0x01, 0xc0,   //     ###        ###
+  0x0e, 0x01, 0xc0,   //     ###        ###
+  0x0e, 0x09, 0xc0,   //     ###     #  ###
+  0x0e, 0x1d, 0xc0,   //     ###    ### ###
+  0x0e, 0x1d, 0xc0,   //     ###    ### ###
+  0x4e, 0xdd, 0xcc,   //  #  ### ## ### ###  ##
+  0xce, 0xdd, 0xcc,   // ##  ### ## ### ###  ##
+  0xce, 0xdd, 0xcc,   // ##  ### ## ### ###  ##
+  0xce, 0xdd, 0xcc,   // ##  ### ## ### ###  ##
+  0xce, 0xcf, 0xcc,   // ##  ### ##  ######  ##
+  0xce, 0xcf, 0xcc,   // ##  ### ##  ######  ##
+  0xce, 0xc3, 0xcc,   // ##  ### ##    ####  ##
+  0xff, 0x81, 0xf8,   // #########      ######
+  0x7e, 0x01, 0xf0,   //  ######        #####
+  0x1e, 0x01, 0xc0,   //    ####        ###
+  0x0e, 0x01, 0xc0,   //     ###        ###
+  0x0e, 0x01, 0xc0,   //     ###        ###
+  0x0e, 0x01, 0xc0,   //     ###        ###
+  0x0e, 0x01, 0xc0,   //     ###        ###
+  0x0e, 0x01, 0xc0,   //     ###        ###
+  0x1e, 0x01, 0xc0,   //    ####        ###
+  0x1e, 0x01, 0xc0,   //    ####        ###
+};
+
+// cactusL3: 33x22
+const uint8_t cactusL3[] PROGMEM = {
+  0x0e, 0x00, 0x00, 0x38, 0x00,   //     ###                   ###
+  0x0e, 0x03, 0x00, 0x38, 0x00,   //     ###       ##          ###
+  0x0e, 0x07, 0x00, 0x38, 0x00,   //     ###      ###          ###
+  0x0e, 0x07, 0x41, 0xb8, 0x00,   //     ###      ### #     ## ###
+  0x0e, 0x07, 0x61, 0xb8, 0x00,   //     ###      ### ##    ## ###
+  0x0e, 0xc7, 0x61, 0xb9, 0x80,   //     ### ##   ### ##    ## ###  ##
+  0xce, 0xc7, 0x61, 0xb9, 0x80,   // ##  ### ##   ### ##    ## ###  ##
+  0xce, 0xd7, 0x61, 0xb9, 0x80,   // ##  ### ## # ### ##    ## ###  ##
+  0xce, 0xdf, 0xc1, 0xb9, 0x80,   // ##  ### ## #######     ## ###  ##
+  0xce, 0xdf, 0x19, 0xf9, 0x80,   // ##  ### ## #####   ##  ######  ##
+  0xce, 0xdf, 0x19, 0xf9, 0x80,   // ##  ### ## #####   ##  ######  ##
+  0xce, 0xdf, 0x5a, 0xf9, 0x80,   // ##  ### ## ##### # ## # #####  ##
+  0xff, 0xdf, 0x7a, 0x3f, 0x00,   // ########## ##### #### #   ######
+  0x7f, 0x9f, 0x7a, 0x3e, 0x00,   //  ########  ##### #### #   #####
+  0x3e, 0x0f, 0x7a, 0x38, 0x00,   //   #####     #### #### #   ###
+  0x0e, 0x07, 0x7e, 0x38, 0x00,   //     ###      ### ######   ###
+  0x0e, 0x07, 0x3c, 0x38, 0x00,   //     ###      ###  ####    ###
+  0x0e, 0x07, 0x18, 0x38, 0x00,   //     ###      ###   ##     ###
+  0x0e, 0x07, 0x18, 0x38, 0x00,   //     ###      ###   ##     ###
+  0x0e, 0x07, 0x18, 0x38, 0x00,   //     ###      ###   ##     ###
+  0x0e, 0x07, 0x18, 0x38, 0x00,   //     ###      ###   ##     ###
+  0x1e, 0x03, 0x08, 0x38, 0x00,   //    ####       ##    #     ###
+};
+
+const int DINO_W = 18, DINO_H = 19, DINO_X = 10;
+const int DINO_FEET_Y = 61; // last pixel row of every sprite; the horizon line is drawn on row 62
+const float DINO_GRAVITY = 725.0f;  // px/s^2
+const float DINO_JUMP_V = 201.6f;   // px/s -> ~28px apex, ~0.56s airtime
+const float DINO_AIR_TIME = 2.0f * DINO_JUMP_V / DINO_GRAVITY;
+const float DINO_SPEED_START = 100.0f; // px/s
+const float DINO_SPEED_MAX = 190.0f;
+const float DINO_ACCEL = 0.75f;        // px/s gained per second
+const float DINO_FIRST_OBSTACLE_SEC = 1.4f;
+const unsigned long DINO_CRASH_HOLD_MS = 700;
+const int DINO_MAX_CACTI = 4;
+const int DINO_MAX_SCORE = 99999;
+const char* const DINO_HI_FILE = "/dino_hi.txt";
+
+struct DinoCactusDef { const uint8_t* bmp; uint8_t w, h; };
+const DinoCactusDef dinoCactusDefs[6] = {
+  {cactusS1, 7, 15}, {cactusS2, 14, 15}, {cactusS3, 22, 15},
+  {cactusL1, 10, 22}, {cactusL2, 22, 22}, {cactusL3, 33, 22}
+};
+struct DinoCactus { float x; uint8_t type; bool active; };
+struct DinoBox { int8_t x0, x1, r0, r1; }; // sprite-local columns [x0,x1) and rows [r0,r1)
+const DinoBox dinoBoxes[3] = { {9, 16, 1, 6}, {1, 12, 7, 15}, {4, 11, 15, 19} }; // head, body, feet
+
+enum DinoState { DINO_READY, DINO_PLAYING, DINO_PAUSED, DINO_CRASHED, DINO_OVER };
+DinoState dinoState = DINO_READY;
+int  dinoCursor = 1; // -1 back, 0 left box, 1 right box
+int  dinoHigh = 0;
+int  dinoScore = 0;
+float dinoY = 0, dinoVy = 0;
+float dinoSpeed = DINO_SPEED_START, dinoDist = 0, dinoRunSec = 0, dinoGroundScroll = 0;
+float dinoTravel = 0, dinoLastW = 0, dinoNextGap = 0;
+bool dinoSpawnedAny = false;
+int8_t dinoLastCat[2] = {-1, -1}; // last two spawned kinds (0 small, 1 large)
+unsigned long dinoLastTick = 0, dinoCrashedAt = 0;
+DinoCactus dinoCacti[DINO_MAX_CACTI];
+uint8_t dinoBumps[32]; // 256-bit ground-bump pattern, scrolls with the world
+
+int dinoRand(int lo, int hi) { return lo + (int)(esp_random() % (uint32_t)(hi - lo + 1)); }
+float dinoRandf() { return (esp_random() % 10000) / 10000.0f; }
+
+// The high score lives in a file on the same LittleFS partition the Restwise timetable uses.
+int dinoLoadHigh() {
+  File f = LittleFS.open(DINO_HI_FILE, "r");
+  if (!f) return 0;
+  int v = f.parseInt();
+  f.close();
+  return constrain(v, 0, DINO_MAX_SCORE);
+}
+
+void dinoSaveHigh(int v) {
+  File f = LittleFS.open(DINO_HI_FILE, "w");
+  if (!f) return;
+  f.print(v);
+  f.close();
+}
+
+void dinoMakeBumps() {
+  memset(dinoBumps, 0, sizeof(dinoBumps));
+  for (int i = 0; i < 256; ) {
+    if (dinoRand(0, 99) < 9) {
+      int len = dinoRand(1, 3);
+      for (int k = 0; k < len; k++) { int p = (i + k) & 255; dinoBumps[p >> 3] |= (1 << (p & 7)); }
+      i += len + 4;
+    } else {
+      i++;
+    }
+  }
+}
+
+void dinoReset() {
+  dinoY = 0; dinoVy = 0; dinoScore = 0;
+  dinoSpeed = DINO_SPEED_START; dinoDist = 0; dinoRunSec = 0; dinoGroundScroll = 0;
+  dinoTravel = 0; dinoLastW = 0; dinoNextGap = 0; dinoSpawnedAny = false;
+  dinoLastCat[0] = dinoLastCat[1] = -1;
+  for (int i = 0; i < DINO_MAX_CACTI; i++) dinoCacti[i].active = false;
+  dinoMakeBumps();
+}
+
+void dinoOpen() {
+  dinoHigh = dinoLoadHigh();
+  dinoReset();
+  dinoState = DINO_READY;
+  dinoCursor = 1;
+}
+
+void dinoStart(bool withJump) {
+  dinoReset();
+  dinoState = DINO_PLAYING;
+  dinoLastTick = millis();
+  if (withJump) dinoVy = DINO_JUMP_V;
+}
+
+void dinoJump() {
+  if (dinoY <= 0.0f && dinoVy <= 0.0f) dinoVy = DINO_JUMP_V;
+}
+
+void dinoSpawn() {
+  int slot = -1;
+  for (int i = 0; i < DINO_MAX_CACTI; i++) if (!dinoCacti[i].active) { slot = i; break; }
+  if (slot < 0) return;
+
+  int cat = (dinoRand(0, 99) < 45) ? 1 : 0;
+  if (dinoLastCat[0] == cat && dinoLastCat[1] == cat) cat = 1 - cat; // never three of a kind in a row
+  // Big groups only once the world is fast enough that a jump can clear their width.
+  int maxSize = 3;
+  if (cat == 1) maxSize = (dinoSpeed >= 170.0f) ? 3 : ((dinoSpeed >= 140.0f) ? 2 : 1);
+  int type = cat * 3 + dinoRand(1, maxSize) - 1;
+
+  dinoCacti[slot] = {128.0f, (uint8_t)type, true};
+  dinoLastCat[1] = dinoLastCat[0];
+  dinoLastCat[0] = cat;
+
+  dinoLastW = dinoCactusDefs[type].w;
+  float minGap = dinoSpeed * DINO_AIR_TIME + 0.4f * dinoLastW; // at least one full jump of room
+  dinoNextGap = minGap * (1.0f + 0.6f * dinoRandf());
+  dinoTravel = 0;
+  dinoSpawnedAny = true;
+}
+
+bool dinoHitsCactus(int idx) { // takes an index, not the struct: Arduino hoists prototypes above type definitions
+  const DinoCactus &c = dinoCacti[idx];
+  const DinoCactusDef &d = dinoCactusDefs[c.type];
+  int cx0 = (int)c.x + 1, cx1 = (int)c.x + d.w - 1; // inset 1px so empty arm corners don't count
+  int cy0 = DINO_FEET_Y - d.h + 1, cy1 = DINO_FEET_Y + 1;
+  int top = DINO_FEET_Y - DINO_H + 1 - (int)(dinoY + 0.5f);
+  for (int i = 0; i < 3; i++) {
+    int bx0 = DINO_X + dinoBoxes[i].x0, bx1 = DINO_X + dinoBoxes[i].x1;
+    int by0 = top + dinoBoxes[i].r0,    by1 = top + dinoBoxes[i].r1;
+    if (bx1 > cx0 && bx0 < cx1 && by1 > cy0 && by0 < cy1) return true;
+  }
+  return false;
+}
+
+void dinoCrash() {
+  dinoState = DINO_CRASHED;
+  dinoCrashedAt = millis();
+  if (dinoScore > dinoHigh) {
+    dinoHigh = dinoScore;
+    dinoSaveHigh(dinoHigh);
+  }
+}
+
+void dinoTick() {
+  if (dinoState == DINO_CRASHED) {
+    if (millis() - dinoCrashedAt >= DINO_CRASH_HOLD_MS) { dinoState = DINO_OVER; dinoCursor = 1; }
+    return;
+  }
+  if (dinoState != DINO_PLAYING) return;
+
+  unsigned long now = millis();
+  float dt = (now - dinoLastTick) / 1000.0f;
+  if (dt <= 0.0f) return;
+  dinoLastTick = now;
+  if (dt > 0.05f) dt = 0.05f;
+
+  if (dinoY > 0.0f || dinoVy > 0.0f) {
+    dinoVy -= DINO_GRAVITY * dt;
+    dinoY += dinoVy * dt;
+    if (dinoY <= 0.0f) { dinoY = 0.0f; dinoVy = 0.0f; }
+  }
+  if (dinoSpeed < DINO_SPEED_MAX) dinoSpeed = min(DINO_SPEED_MAX, dinoSpeed + DINO_ACCEL * dt);
+
+  float step = dinoSpeed * dt;
+  dinoDist += step;
+  dinoRunSec += dt;
+  dinoGroundScroll += step;
+  dinoScore = min(DINO_MAX_SCORE, (int)(dinoDist * 0.1f));
+
+  for (int i = 0; i < DINO_MAX_CACTI; i++) {
+    if (!dinoCacti[i].active) continue;
+    dinoCacti[i].x -= step;
+    if (dinoCacti[i].x + dinoCactusDefs[dinoCacti[i].type].w < 0) dinoCacti[i].active = false;
+  }
+
+  if (!dinoSpawnedAny) {
+    if (dinoRunSec >= DINO_FIRST_OBSTACLE_SEC) dinoSpawn();
+  } else {
+    dinoTravel += step;
+    if (dinoTravel >= dinoLastW + dinoNextGap) dinoSpawn();
+  }
+
+  for (int i = 0; i < DINO_MAX_CACTI; i++) {
+    if (dinoCacti[i].active && dinoHitsCactus(i)) { dinoCrash(); return; }
+  }
+}
+
+void dinoHandleButtons() {
+  switch (dinoState) {
+    case DINO_READY:
+      if (buttonJustPressed[0]) dinoStart(true);
+      if (buttonJustPressed[4]) startAnimation(SCREEN_MENU, 64);
+      break;
+
+    case DINO_PLAYING:
+      if (buttonJustPressed[0]) dinoJump();
+      if (buttonJustPressed[4]) { dinoState = DINO_PAUSED; dinoCursor = 0; }
+      break;
+
+    case DINO_CRASHED:
+      break;
+
+    case DINO_PAUSED:
+    case DINO_OVER:
+      if (buttonJustPressed[0]) dinoCursor = -1;
+      if (buttonJustPressed[1] && dinoCursor == -1) dinoCursor = 0;
+      if (buttonJustPressed[2]) dinoCursor = 0;
+      if (buttonJustPressed[3]) dinoCursor = 1;
+      if (buttonJustPressed[4]) {
+        if (dinoCursor == -1) {
+          startAnimation(SCREEN_MENU, 64);
+        } else if (dinoState == DINO_PAUSED) {
+          if (dinoCursor == 0) { dinoLastTick = millis(); dinoState = DINO_PLAYING; }
+          else startAnimation(SCREEN_MENU, 64);
+        } else {
+          if (dinoCursor == 0) startAnimation(SCREEN_MENU, 64);
+          else dinoStart(false);
+        }
+      }
+      break;
+  }
+}
+
+void drawDinoHeader(int yOffset, bool backFocused) {
+  display.drawFastHLine(0, 12 + yOffset, 128, SSD1306_WHITE);
+  display.setTextSize(1);
+  if (backFocused) {
+    display.fillRect(0, yOffset, 24, 12, SSD1306_WHITE);
+    display.setTextColor(SSD1306_BLACK);
+  } else {
+    display.setTextColor(SSD1306_WHITE);
+  }
+  display.setCursor(2, 2 + yOffset);
+  display.print("<--");
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(28, 2 + yOffset);
+  display.print("Dino Game");
+
+  char buf[12];
+  sprintf(buf, dinoHigh >= 10000 ? "HI%d" : "HI %d", dinoHigh);
+  int16_t x1, y1; uint16_t w, h;
+  display.getTextBounds(buf, 0, 0, &x1, &y1, &w, &h);
+  display.setCursor(127 - w - x1, 2 + yOffset);
+  display.print(buf);
+}
+
+void drawDinoGameOver(int yOffset) {
+  display.setTextColor(SSD1306_WHITE);
+  drawCenteredText(display, "GAME OVER", 15 + yOffset, 2);
+  char buf[24];
+  sprintf(buf, "High Score: %d", dinoHigh);
+  drawCenteredText(display, buf, 31 + yOffset, 1);
+  sprintf(buf, "Score: %d", dinoScore);
+  drawCenteredText(display, buf, 40 + yOffset, 1);
+  drawBoxedCenteredText(display, "EXIT", 6, 50 + yOffset, 44, 13, (dinoCursor == 0));
+  drawBoxedCenteredText(display, "PLAY AGAIN", 56, 50 + yOffset, 66, 13, (dinoCursor == 1));
+}
+
+void drawDino(int yOffset) {
+  bool menuState = (dinoState == DINO_PAUSED || dinoState == DINO_OVER);
+  drawDinoHeader(yOffset, menuState && dinoCursor == -1);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  if (dinoState == DINO_OVER) { drawDinoGameOver(yOffset); return; }
+
+  display.drawFastHLine(0, 62 + yOffset, 128, SSD1306_WHITE);
+  int scroll = (int)dinoGroundScroll;
+  for (int x = 0; x < 128; x++) {
+    int p = (x + scroll) & 255;
+    if (dinoBumps[p >> 3] & (1 << (p & 7))) display.drawPixel(x, 63 + yOffset, SSD1306_WHITE);
+  }
+
+  for (int i = 0; i < DINO_MAX_CACTI; i++) {
+    if (!dinoCacti[i].active) continue;
+    const DinoCactusDef &d = dinoCactusDefs[dinoCacti[i].type];
+    display.drawBitmap((int)dinoCacti[i].x, DINO_FEET_Y - d.h + 1 + yOffset, d.bmp, d.w, d.h, SSD1306_WHITE);
+  }
+
+  const uint8_t *spr;
+  if (dinoState == DINO_CRASHED) spr = dinoDead;
+  else if (dinoState == DINO_READY) spr = ((millis() / 150) % 12 == 0) ? dinoBlink : dinoStand;
+  else if (dinoY > 0.0f) spr = dinoStand;
+  else spr = (((int)(dinoRunSec * 12.0f)) & 1) ? dinoRun2 : dinoRun1;
+  display.drawBitmap(DINO_X, DINO_FEET_Y - DINO_H + 1 - (int)(dinoY + 0.5f) + yOffset, spr, DINO_W, DINO_H, SSD1306_WHITE);
+
+  if (dinoState == DINO_READY) {
+    drawCenteredText(display, "Press UP to start", 22 + yOffset, 1);
+    drawCenteredText(display, "CENTER: exit", 32 + yOffset, 1);
+  } else {
+    char buf[8];
+    sprintf(buf, "%05d", dinoScore);
+    display.setCursor(97, 15 + yOffset);
+    display.print(buf);
+  }
+
+  if (dinoState == DINO_PAUSED) {
+    display.fillRect(10, 16 + yOffset, 108, 44, SSD1306_BLACK);
+    display.drawRect(10, 16 + yOffset, 108, 44, SSD1306_WHITE);
+    drawCenteredText(display, "Game Paused", 21 + yOffset, 1);
+    drawBoxedCenteredText(display, "RESUME", 16, 36 + yOffset, 44, 16, (dinoCursor == 0));
+    drawBoxedCenteredText(display, "EXIT", 68, 36 + yOffset, 44, 16, (dinoCursor == 1));
+  }
 }
 
 /* ---------------------------- WiFi app ---------------------------- */
@@ -1516,6 +2086,7 @@ void setup() {
   rwLoadFromFile();
   loadCredentials(); // saved WiFi SSID/password pairs -- WiFi itself stays off until asked
   loadBatterySettings(); // watchface indicator mode (icon vs. %), survives deep sleep
+  buildMenu();
 
   lastActivityTime = millis();
 }
@@ -1566,7 +2137,8 @@ void loop() {
   // Idle blanking runs on every screen the user might be sitting on. The single
   // exception is animations -- blanking mid-slide would strand the transition
   // halfway. This gives the Lock Screen timeout its intended global effect.
-  bool allowBlank = !isAnimating && currentScreen != SCREEN_ANIMATOR &&
+  bool dinoRunning = (currentScreen == SCREEN_DINO && dinoState == DINO_PLAYING);
+  bool allowBlank = !isAnimating && currentScreen != SCREEN_ANIMATOR && !dinoRunning &&
                      currentScreen != SCREEN_WIFI_SCANNING &&
                      currentScreen != SCREEN_WIFI_PASSWORD &&
                      currentScreen != SCREEN_WIFI_NTP &&
@@ -1592,7 +2164,7 @@ void loop() {
   // WiFi scan/password-entry/connect/NTP-sync in flight, or a pending AI
   // reply. Otherwise WiFi is free to keep running through an ordinary
   // display-off idle blank -- only deep sleep forces it off.
-  bool allowDeepSleep = !isAnimating && currentScreen != SCREEN_ANIMATOR &&
+  bool allowDeepSleep = !isAnimating && currentScreen != SCREEN_ANIMATOR && !dinoRunning &&
                         !swRunning && tmMode != TM_RUNNING &&
                         rwSyncState != RWS_RECV &&
                         currentScreen != SCREEN_WIFI_SCANNING &&
@@ -1647,34 +2219,35 @@ void loop() {
       }
       else if (currentScreen == SCREEN_MENU) {
         if (buttonJustPressed[0]) {
-          menuIndex = (menuIndex - 1 + NUM_MENU_ITEMS) % NUM_MENU_ITEMS;
+          menuIndex = (menuIndex - 1 + menuCount) % menuCount;
         }
         if (buttonJustPressed[1]) {
-          menuIndex = (menuIndex + 1) % NUM_MENU_ITEMS;
+          menuIndex = (menuIndex + 1) % menuCount;
         }
         if (buttonJustPressed[4]) {
-          if (menuIndex == 0) {
+          int app = menuApps[menuIndex];
+          if (app == APP_RESTWISE) {
             rwCursor = -1;
             startAnimation(SCREEN_RESTWISE, -64);
-          } else if (menuIndex == 1) {
+          } else if (app == APP_STOPWATCH) {
             swFocus = 1;
             startAnimation(SCREEN_STOPWATCH, -64);
-          } else if (menuIndex == 2) {
+          } else if (app == APP_TIMER) {
             tmMode = TM_SETTING;
             tmFocus = 1;
             startAnimation(SCREEN_TIMER, -64);
-          } else if (menuIndex == 3) {
+          } else if (app == APP_CALCULATOR) {
             calcCursorRow = 0; calcCursorCol = 0;
             calcInput1 = ""; calcInput2 = ""; calcOp = ' '; calcIsOpSet = false; calcError = false;
             startAnimation(SCREEN_CALCULATOR, -64);
-          } else if (menuIndex == 4) {
+          } else if (app == APP_ANIMATOR) {
             animatorSceneIndex = 0;
             animatorSceneStart = millis();
             startAnimation(SCREEN_ANIMATOR, -64);
-          } else if (menuIndex == 5) {
+          } else if (app == APP_BATTERY) {
             battCursor = -1;
             startAnimation(SCREEN_BATTERY, -64);
-          } else if (menuIndex == 6) {
+          } else if (app == APP_WIFI) {
             if (WiFi.status() == WL_CONNECTED) {
               wifiHomeCursor = 0;
               startAnimation(SCREEN_WIFI_HOME, -64);
@@ -1689,7 +2262,7 @@ void loop() {
               wifiConfirmCursor = 0;
               startAnimation(SCREEN_WIFI_CONFIRM, -64);
             }
-          } else if (menuIndex == 7) {
+          } else if (app == APP_AI) {
             // Stricter than AIO_Transmitter's own gate (WiFi-connected only) --
             // this one requires real internet reachability too, not just AP
             // association, per explicit request.
@@ -1699,7 +2272,10 @@ void loop() {
             } else {
               startAnimation(SCREEN_AI_NOWIFI, -64);
             }
-          } else if (menuIndex == 8) {
+          } else if (app == APP_DINO) {
+            dinoOpen();
+            startAnimation(SCREEN_DINO, -64);
+          } else if (app == APP_SECURITY) {
             if (pinSet) {
               pendingAction = ACT_OPEN_MENU;
               enterPinScreen(SEC_VERIFY, SCREEN_MENU);
@@ -1708,16 +2284,16 @@ void loop() {
               confirmSelection = 0;
               startAnimation(SCREEN_SECURITY_CONFIRM, -64);
             }
-          } else if (menuIndex == 9) {
+          } else if (app == APP_LOCKSCREEN) {
             lockSettingsCursor = -1;
             for (int i = 0; i < 4; i++) if (lockTimeoutOptions[i] == displayTimeoutSec) lockSettingsCursor = i;
             if (lockSettingsCursor == -1) lockSettingsCursor = 0;
             startAnimation(SCREEN_LOCK_SETTINGS, -64);
-          } else if (menuIndex == 10) {
+          } else if (app == APP_TERMINAL) {
             termState = TERM_IDLE;
             termLineBuf = "";
             startAnimation(SCREEN_TERMINAL, -64);
-          } else if (menuIndex == 11) {
+          } else if (app == APP_LOCK) {
             startAnimation(SCREEN_WATCHFACE, 64);
           }
         }
@@ -1750,6 +2326,9 @@ void loop() {
             startAnimation(SCREEN_BATTERY, 64);
           }
         }
+      }
+      else if (currentScreen == SCREEN_DINO) {
+        dinoHandleButtons();
       }
       else if (currentScreen == SCREEN_WIFI_CONFIRM) {
         if (buttonJustPressed[0]) wifiConfirmCursor = -1;
@@ -2370,6 +2949,8 @@ void loop() {
       }
     }
 
+    if (currentScreen == SCREEN_DINO && !isAnimating) dinoTick();
+
     if (pinErrorMsg.length() > 0 && millis() - pinErrorShownAt > 1500) pinErrorMsg = "";
 
     static unsigned long lastStatusUpdate = 0;
@@ -2607,6 +3188,7 @@ void drawScreen(ScreenState screen, int yOffset) {
   else if (screen == SCREEN_ANIMATOR) drawAnimator(yOffset);
   else if (screen == SCREEN_BATTERY) drawBattery(yOffset);
   else if (screen == SCREEN_BATTERY_INDICATOR) drawBatteryIndicator(yOffset);
+  else if (screen == SCREEN_DINO) drawDino(yOffset);
   else if (screen == SCREEN_WIFI_CONFIRM) drawWifiConfirm(yOffset);
   else if (screen == SCREEN_WIFI_SCANNING) drawWifiScanning(yOffset);
   else if (screen == SCREEN_WIFI_RESULTS) drawWifiResults(yOffset);
@@ -2703,7 +3285,7 @@ void drawMenu(int yOffset) {
   int listY = 16 + yOffset;
 
   int startIdx = (menuIndex < 4) ? 0 : menuIndex - 3;
-  int endIdx = min(startIdx + 4, (int)NUM_MENU_ITEMS);
+  int endIdx = min(startIdx + 4, menuCount);
 
   for (int i = startIdx; i < endIdx; i++) {
     int y = listY + ((i - startIdx) * itemH);
@@ -2716,7 +3298,7 @@ void drawMenu(int yOffset) {
     }
 
     display.setCursor(4, y);
-    display.print(menuItems[i]);
+    display.print(menuAppNames[menuApps[i]]);
   }
 }
 
