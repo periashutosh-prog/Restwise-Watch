@@ -1,0 +1,6 @@
+# Contains the real Groq API key -- never commit this. See ai_config.example.h.
+ai_config.h
+
+# Arduino build artifacts
+build/
+*.bin

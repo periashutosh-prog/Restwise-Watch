@@ -52,7 +52,16 @@
 #include "esp_sleep.h"
 #include <Preferences.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <ArduinoJson.h>
 #include "time.h"
+
+// Groq API key + model, kept out of the repo (ai_config.h is gitignored).
+#if __has_include("ai_config.h")
+  #include "ai_config.h"
+#else
+  #error "Missing ai_config.h - copy ai_config.example.h to ai_config.h and add your Groq API key."
+#endif
 
 // Master switch for the WiFi app/feature. Flip to false to hard-block the
 // radio from ever being enabled (even if the UI is still reachable) without
@@ -119,18 +128,19 @@ enum ScreenState {
   SCREEN_PIN_ENTRY, SCREEN_SECURITY_MENU, SCREEN_SECURITY_CONFIRM,
   SCREEN_LOCK_SETTINGS, SCREEN_TERMINAL,
   SCREEN_RESTWISE, SCREEN_RESTWISE_DAY, SCREEN_GOODNIGHT,
-  SCREEN_ANIMATOR, SCREEN_BATTERY,
+  SCREEN_ANIMATOR, SCREEN_BATTERY, SCREEN_BATTERY_INDICATOR,
   SCREEN_WIFI_CONFIRM, SCREEN_WIFI_SCANNING, SCREEN_WIFI_RESULTS,
   SCREEN_WIFI_PASSWORD, SCREEN_WIFI_KEYBOARD, SCREEN_WIFI_HOME,
-  SCREEN_WIFI_TOGGLE_CONFIRM, SCREEN_WIFI_FORGET_CONFIRM, SCREEN_WIFI_NTP
+  SCREEN_WIFI_TOGGLE_CONFIRM, SCREEN_WIFI_FORGET_CONFIRM, SCREEN_WIFI_NTP,
+  SCREEN_AI_NOWIFI, SCREEN_AI_CHAT
 };
 ScreenState currentScreen = SCREEN_WATCHFACE;
 
 bool lastButtonStates[5] = {false, false, false, false, false};
 bool buttonJustPressed[5] = {false, false, false, false, false};
 
-const int NUM_MENU_ITEMS = 11;
-const char* menuItems[NUM_MENU_ITEMS] = {"Restwise", "Stopwatch", "Timer", "Calculator", "Animator", "Battery", "WiFi", "Security", "Lock Screen", "Terminal", "Lock"};
+const int NUM_MENU_ITEMS = 12;
+const char* menuItems[NUM_MENU_ITEMS] = {"Restwise", "Stopwatch", "Timer", "Calculator", "Animator", "Battery", "WiFi", "AI Chatbot", "Security", "Lock Screen", "Terminal", "Lock"};
 int menuIndex = 0;
 
 unsigned long swStartTime = 0;
@@ -242,6 +252,37 @@ const char* kbSymbol[4][11] = {
   {"/","?",";",":","`","(",")","CL","CR","^","BS"},
   {"[","]","{","}","<",">","#","_","."," ","EN"}
 };
+
+// ---- AI Chatbot (ported from AIO_Transmitter) ----
+// Transcript lives in plain globals: leaving the app and coming back keeps
+// the thread, a reboot wipes it -- exactly the lifetime this needs.
+struct AiMsg { bool fromUser; String text; };
+const int AI_MAX_MSGS = 16;   // ring buffer; oldest drops off the top
+const int AI_CTX_MSGS = 8;    // how many turns get resent as context
+AiMsg aiMsgs[AI_MAX_MSGS];
+int  aiMsgCount = 0;
+
+// Layout: header 0-12, transcript 13-48, input row 49-62.
+const int AI_LINE_H     = 9;
+const int AI_VIEW_TOP   = 14;
+const int AI_VIEW_H     = 36;   // 14..49, 4 lines
+const int AI_WRAP_CHARS = 20;   // 6px glyphs, leaving room for the focus border
+
+int  aiFocus       = 1;   // -1 = "<--", 0 = message area, 1 = input box, 2 = SEND
+bool aiScrollMode  = false;
+int  aiScroll      = 0;
+String aiInputText = "";
+
+// UI thread <-> network task handshake. Each flag has exactly one writer at
+// any point in the cycle, so no mutex is needed: the UI fills aiPendingBody
+// and raises aiRequestPending, the task consumes it and raises aiReplyReady,
+// the UI drains that and drops aiBusy.
+volatile bool aiRequestPending = false;
+volatile bool aiReplyReady     = false;
+volatile bool aiBusy           = false;
+String aiPendingBody;
+String aiReplyText;
+bool   aiTaskStarted = false;
 
 enum TimerMode { TM_SETTING, TM_READY, TM_RUNNING, TM_RINGING };
 TimerMode tmMode = TM_SETTING;
@@ -441,6 +482,9 @@ const char* rwDayName(int item);
 bool isNightNow();
 void enterDeepSleep();
 void drawBattery(int yOffset);
+void drawBatteryIndicator(int yOffset);
+void loadBatterySettings();
+void saveBatterySettings();
 void drawWifiConfirm(int yOffset);
 void drawWifiScanning(int yOffset);
 void drawWifiResults(int yOffset);
@@ -456,12 +500,22 @@ String findSavedPwd(String ssid);
 bool ntpQueryOnce(const char* host, uint32_t &outUnixTime, unsigned long timeoutMs);
 void ntpQueryTask(void *pv);
 void startNtpSync();
+String aiToAscii(const String &in);
+void aiAppendMsg(bool fromUser, const String &text);
+String aiCallGroq(const String &body);
+void aiChatTask(void *p);
+void aiStartTask();
+void aiSendMessage();
+int aiRenderChat(int baseY, bool draw, int yOffset = 0);
+void drawAiNoWifi(int yOffset);
+void drawAiChat(int yOffset);
 void drawWifiNTP(int yOffset);
 void connectivityTask(void *p);
 void startConnectivityPinger();
 void drawWifiStatusIcon(int x, int y);
 void drawTowerStatusIcon(int x, int y);
 void drawBatteryIcon(int x, int y);
+void drawBatteryStatusGlyph(int rightEdgeX, int y);
 
 /* ---------------------------- Battery monitoring ---------------------------- */
 // A dedicated FreeRTOS task samples the ADC 1000x/sec and posts one averaged
@@ -479,6 +533,17 @@ volatile float batteryVoltage = 0.0f;
 volatile int batteryAdcRaw = 0;        // averaged raw 12-bit ADC count (0-4095), for display/debug
 volatile int batteryAdcMilliVolts = 0; // averaged, calibrated pin voltage (pre-divider), for display/debug
 volatile bool batteryReadingValid = false;
+
+// Un-averaged "instant" readings, latched from a single sample every 100ms
+// (every 100th tick of the same 1000Hz loop) -- shows the raw, jittery signal
+// side by side with the smoothed Voltage/Est. Battery figures above.
+volatile int   batteryAdcRawInstant   = 0;
+volatile float batteryVoltageInstant  = 0.0f;
+
+// Battery app UI state.
+int  battCursor    = -1; // -1 = back box, 0 = "Indicator" row
+int  battIndCursor = -1; // on SCREEN_BATTERY_INDICATOR: -1 = back, 0 = Icon box, 1 = %age box
+bool battShowPercent = false; // false = watchface shows icon, true = shows "NN%" text
 
 // Rolling ~8-second history of the once-a-second averages, used to detect a
 // charging cell: CC/CV charging makes voltage climb steadily, so a clear rise
@@ -518,11 +583,37 @@ void batteryAdcTask(void *pvParameters) {
   analogReadResolution(12);
   analogSetPinAttenuation(PIN_BATTERY_ADC, ADC_11db);
 
+  // Seed everything with one real sample right away. Without this, Voltage/
+  // Est. Battery/the watchface icon would sit at 0 (uninitialized) for the
+  // ~1s the first full 1000-sample average takes -- a visible jump from
+  // empty-icon/"--" straight to the real level. The seed gets overwritten by
+  // the first proper average a second later, so it only affects that first
+  // instant on boot (and on every deep-sleep wake, which re-runs this task).
+  {
+    int mvSeed  = analogReadMilliVolts(PIN_BATTERY_ADC);
+    int rawSeed = analogRead(PIN_BATTERY_ADC);
+    float vSeed = (mvSeed / 1000.0f) * BATTERY_DIVIDER_RATIO;
+    batteryVoltage        = vSeed;
+    batteryAdcRaw         = rawSeed;
+    batteryAdcMilliVolts  = mvSeed;
+    batteryAdcRawInstant  = rawSeed;
+    batteryVoltageInstant = vSeed;
+    batteryReadingValid   = true;
+  }
+
   for (;;) {
     uint32_t sumMv = 0, sumRaw = 0;
     for (int i = 0; i < BATTERY_SAMPLES_PER_SEC; i++) {
-      sumMv += analogReadMilliVolts(PIN_BATTERY_ADC);
-      sumRaw += analogRead(PIN_BATTERY_ADC);
+      int mvSample  = analogReadMilliVolts(PIN_BATTERY_ADC);
+      int rawSample = analogRead(PIN_BATTERY_ADC);
+      sumMv += mvSample;
+      sumRaw += rawSample;
+
+      if (i % 100 == 0) { // ~every 100ms: latch this single un-averaged sample
+        batteryAdcRawInstant  = rawSample;
+        batteryVoltageInstant = (mvSample / 1000.0f) * BATTERY_DIVIDER_RATIO;
+      }
+
       vTaskDelay(1); // ~1ms tick -> ~1000 samples spread across ~1 second
     }
     float avgMilliVolts = (float)sumMv / BATTERY_SAMPLES_PER_SEC;
@@ -563,34 +654,136 @@ void drawBatteryIcon(int x, int y) {
   }
 }
 
+// Watchface top-right battery status, in whichever mode the user picked on
+// SCREEN_BATTERY_INDICATOR: the 4-segment icon, or plain "NN%" text.
+// rightEdgeX is where the glyph's right edge should land.
+void drawBatteryStatusGlyph(int rightEdgeX, int y) {
+  if (!battShowPercent) {
+    drawBatteryIcon(rightEdgeX - 16, y);
+    return;
+  }
+  int percent = batteryReadingValid ? batteryVoltageToPercent(batteryVoltage) : 0;
+  char buf[6];
+  sprintf(buf, "%d%%", percent);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  int16_t x1, y1; uint16_t w, h;
+  display.getTextBounds(buf, 0, 0, &x1, &y1, &w, &h);
+  display.setCursor(rightEdgeX - w - x1, y);
+  display.print(buf);
+}
+
+// Battery screen content is taller than the 64px display, so it scrolls:
+// focusing the back box shows the top rows, focusing the Indicator row
+// scrolls down to reveal Raw ADC / Raw Voltage / Indicator at the bottom.
+const int BATT_ROW_H = 12;
+const int BATT_ROW_TOP = 18;
+const int BATT_SCROLL_DOWN = 36;
+
 void drawBattery(int yOffset) {
-  drawHeader(yOffset, "BATTERY", true); // back box always focused -- CENTER exits
+  bool backSel = (battCursor == -1);
+  drawHeader(yOffset, "BATTERY", backSel);
 
   float v = batteryVoltage;
   int percent = batteryVoltageToPercent(v);
+  int scrollY = (battCursor == -1) ? 0 : BATT_SCROLL_DOWN;
 
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   char buf[24];
 
-  display.setCursor(2, 18 + yOffset);
-  if (batteryReadingValid) sprintf(buf, "Voltage: %.2fV", v);
-  else strcpy(buf, "Voltage: --");
-  display.print(buf);
+  // Row 0: Voltage (averaged)
+  int y = BATT_ROW_TOP + 0 * BATT_ROW_H - scrollY + yOffset;
+  if (y >= 13 + yOffset) {
+    display.setCursor(2, y);
+    if (batteryReadingValid) sprintf(buf, "Voltage: %.2fV", v);
+    else strcpy(buf, "Voltage: --");
+    display.print(buf);
+  }
 
-  display.setCursor(2, 30 + yOffset);
-  if (batteryReadingValid) sprintf(buf, "Est. Battery: %d%%", percent);
-  else strcpy(buf, "Est. Battery: --");
-  display.print(buf);
+  // Row 1: Est. Battery %
+  y = BATT_ROW_TOP + 1 * BATT_ROW_H - scrollY + yOffset;
+  if (y >= 13 + yOffset) {
+    display.setCursor(2, y);
+    if (batteryReadingValid) sprintf(buf, "Est. Battery: %d%%", percent);
+    else strcpy(buf, "Est. Battery: --");
+    display.print(buf);
+  }
 
-  display.setCursor(2, 42 + yOffset);
-  if (batteryReadingValid) sprintf(buf, "ADC: %d (%dmV)", batteryAdcRaw, batteryAdcMilliVolts);
-  else strcpy(buf, "ADC: --");
-  display.print(buf);
+  // Row 2: ADC (averaged)
+  y = BATT_ROW_TOP + 2 * BATT_ROW_H - scrollY + yOffset;
+  if (y >= 13 + yOffset) {
+    display.setCursor(2, y);
+    if (batteryReadingValid) sprintf(buf, "ADC: %d (%dmV)", batteryAdcRaw, batteryAdcMilliVolts);
+    else strcpy(buf, "ADC: --");
+    display.print(buf);
+  }
 
-  display.setCursor(2, 54 + yOffset);
-  display.print("Charging: ");
-  display.print(batteryCharging ? "True" : "False");
+  // Row 3: Charging
+  y = BATT_ROW_TOP + 3 * BATT_ROW_H - scrollY + yOffset;
+  if (y >= 13 + yOffset) {
+    display.setCursor(2, y);
+    display.print("Charging: ");
+    display.print(batteryCharging ? "True" : "False");
+  }
+
+  // Row 4: Raw ADC (un-averaged, 100ms)
+  y = BATT_ROW_TOP + 4 * BATT_ROW_H - scrollY + yOffset;
+  if (y >= 13 + yOffset) {
+    display.setCursor(2, y);
+    sprintf(buf, "Raw ADC: %d", batteryAdcRawInstant);
+    display.print(buf);
+  }
+
+  // Row 5: Raw Voltage (un-averaged, 100ms)
+  y = BATT_ROW_TOP + 5 * BATT_ROW_H - scrollY + yOffset;
+  if (y >= 13 + yOffset) {
+    display.setCursor(2, y);
+    sprintf(buf, "Raw Voltage: %.2fV", batteryVoltageInstant);
+    display.print(buf);
+  }
+
+  // Row 6: Indicator (focusable -- opens SCREEN_BATTERY_INDICATOR)
+  y = BATT_ROW_TOP + 6 * BATT_ROW_H - scrollY + yOffset;
+  if (y >= 13 + yOffset) {
+    bool sel = (battCursor == 0);
+    if (sel) { display.fillRect(0, y - 1, 128, BATT_ROW_H, SSD1306_WHITE); display.setTextColor(SSD1306_BLACK); }
+    else      { display.setTextColor(SSD1306_WHITE); }
+    display.setCursor(2, y);
+    display.print("Indicator: ");
+    display.print(battShowPercent ? "Percentage" : "Icon");
+    display.setTextColor(SSD1306_WHITE);
+  }
+
+  // Scrollbar hint on the right edge -- two discrete positions (top/bottom).
+  display.drawFastVLine(126, 13 + yOffset, 50, SSD1306_WHITE);
+  int thumbY = 13 + yOffset + ((scrollY == 0) ? 0 : 30);
+  display.fillRect(125, thumbY, 3, 20, SSD1306_WHITE);
+}
+
+void drawBatteryIndicator(int yOffset) {
+  bool backSel = (battIndCursor == -1);
+  drawHeader(yOffset, "Battery", backSel);
+  display.setTextColor(SSD1306_WHITE);
+  drawCenteredText(display, "Choose Battery", 22 + yOffset, 1);
+  drawCenteredText(display, "Indicator", 32 + yOffset, 1);
+  drawBoxedCenteredText(display, "ICON", 14, 48 + yOffset, 40, 13, (battIndCursor == 0));
+  drawBoxedCenteredText(display, "%AGE", 74, 48 + yOffset, 40, 13, (battIndCursor == 1));
+}
+
+// Persisted via NVS (same Preferences mechanism as WiFi credentials) so the
+// choice survives deep sleep -- deep sleep re-runs setup() from scratch, so a
+// plain global would otherwise silently reset to "Icon" on every wake.
+void loadBatterySettings() {
+  prefs.begin("batt_set", true);
+  battShowPercent = prefs.getBool("pct", false);
+  prefs.end();
+}
+
+void saveBatterySettings() {
+  prefs.begin("batt_set", false);
+  prefs.putBool("pct", battShowPercent);
+  prefs.end();
 }
 
 /* ---------------------------- WiFi app ---------------------------- */
@@ -708,7 +901,8 @@ void drawWifiKeyboard() {
 
   if (kbInputBuffer.length() == 0) {
     display.setTextColor(0x5555);
-    display.print("Type password...");
+    if (kbReturnScreen == SCREEN_AI_CHAT) display.print("Type message...");
+    else display.print("Type password...");
     display.setTextColor(SSD1306_WHITE);
   } else {
     display.print(disp);
@@ -931,6 +1125,270 @@ void drawWifiNTP(int yOffset) {
   }
 }
 
+// The SSD1306 font is a 7-bit glyph table, so any UTF-8 the model emits (it
+// likes non-breaking hyphens and curly quotes) would render as garbage. Fold
+// the common punctuation down to ASCII and drop anything else non-Latin.
+String aiToAscii(const String &in) {
+  String out;
+  out.reserve(in.length());
+
+  unsigned int i = 0;
+  while (i < in.length()) {
+    uint8_t c = (uint8_t)in[i];
+
+    if (c < 0x80) {
+      if (c == '\n' || c == '\r' || c == '\t') out += ' ';
+      else if (c >= 32 && c < 127)             out += (char)c;
+      i++;
+      continue;
+    }
+
+    uint32_t cp = 0; int len = 1;
+    if      ((c & 0xE0) == 0xC0) { cp = c & 0x1F; len = 2; }
+    else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; len = 3; }
+    else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; len = 4; }
+    for (int k = 1; k < len && (i + k) < in.length(); k++) cp = (cp << 6) | ((uint8_t)in[i + k] & 0x3F);
+
+    if      (cp == 0x2018 || cp == 0x2019 || cp == 0x2032) out += '\'';
+    else if (cp == 0x201C || cp == 0x201D)                 out += '"';
+    else if (cp >= 0x2010 && cp <= 0x2015)                 out += '-';
+    else if (cp == 0x00A0 || cp == 0x2007 || cp == 0x202F) out += ' ';
+    else if (cp == 0x2026)                                 out += "...";
+    // anything else (emoji, CJK, symbols) has no glyph -- drop it
+
+    i += len;
+  }
+
+  out.trim();
+  return out;
+}
+
+void aiAppendMsg(bool fromUser, const String &text) {
+  if (aiMsgCount >= AI_MAX_MSGS) {
+    for (int i = 1; i < AI_MAX_MSGS; i++) aiMsgs[i - 1] = aiMsgs[i];
+    aiMsgCount = AI_MAX_MSGS - 1;
+  }
+  aiMsgs[aiMsgCount].fromUser = fromUser;
+  aiMsgs[aiMsgCount].text     = text;
+  aiMsgCount++;
+
+  // Jump to the newest line, matching how every chat app behaves.
+  aiScroll = max(0, aiRenderChat(0, false) - AI_VIEW_H);
+}
+
+String aiCallGroq(const String &body) {
+  if (WiFi.status() != WL_CONNECTED) return "[No WiFi]";
+
+  WiFiClientSecure client;
+  client.setInsecure();          // no cert bundle on device; TLS without pinning
+  client.setTimeout(20000);
+
+  HTTPClient http;
+  http.setConnectTimeout(8000);
+  http.setTimeout(20000);
+  if (!http.begin(client, "https://api.groq.com/openai/v1/chat/completions")) return "[Connect failed]";
+
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Authorization", String("Bearer ") + GROQ_API_KEY);
+
+  int code = http.POST(body);
+  String out;
+
+  if (code == 200) {
+    JsonDocument filter;
+    filter["choices"][0]["message"]["content"] = true;
+
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, http.getStream(),
+                                               DeserializationOption::Filter(filter));
+    if (err) {
+      out = "[Bad response]";
+    } else {
+      const char* c = doc["choices"][0]["message"]["content"];
+      out = (c && *c) ? String(c) : String("[Empty reply]");
+    }
+  } else if (code > 0) {
+    String errBody = http.getString();
+    Serial.printf("[AI] HTTP %d error body: %s\n", code, errBody.c_str());
+
+    // Groq returns a JSON body like {"error":{"message":"...","code":"..."}}
+    // on failure -- pull that out for a useful chat reply instead of a bare
+    // status code (e.g. "model_decommissioned" tells you exactly what's wrong).
+    JsonDocument errDoc;
+    DeserializationError errErr = deserializeJson(errDoc, errBody);
+    if (!errErr && errDoc["error"]["message"].is<const char*>()) {
+      out = "[HTTP " + String(code) + "] " + String((const char*)errDoc["error"]["message"]);
+    } else {
+      out = "[HTTP " + String(code) + "] " + errBody;
+    }
+  } else {
+    out = "[Network error]";
+  }
+
+  http.end();
+  return aiToAscii(out);
+}
+
+void aiChatTask(void *p) {
+  for (;;) {
+    if (aiRequestPending) {
+      aiRequestPending = false;
+      String reply = aiCallGroq(aiPendingBody);
+      aiPendingBody = "";
+      aiReplyText   = reply;
+      aiReplyReady  = true;
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
+void aiStartTask() {
+  if (aiTaskStarted) return;
+  aiTaskStarted = true;
+  // TLS handshake is stack-hungry -- 4096 (what the pinger uses for plain
+  // HTTP) overflows here.
+  xTaskCreate(aiChatTask, "AiChat", 12288, NULL, 1, NULL);
+}
+
+void aiSendMessage() {
+  if (aiBusy || aiInputText.length() == 0) return;
+
+  aiAppendMsg(true, aiInputText);
+  aiInputText = "";
+
+  // Body is built here, on the UI thread, so the network task never touches
+  // aiMsgs -- that keeps the transcript single-writer and mutex-free.
+  JsonDocument doc;
+  doc["model"]       = GROQ_MODEL;
+  doc["max_tokens"]  = 200;
+  doc["temperature"] = 0.7;
+
+  JsonArray msgs = doc["messages"].to<JsonArray>();
+  JsonObject sys = msgs.add<JsonObject>();
+  sys["role"]    = "system";
+  sys["content"] = "You are a helpful assistant answering on a 128x64 pixel OLED "
+                   "handheld. Keep every reply under 40 words. Use plain ASCII only: "
+                   "no markdown, no emoji, no curly quotes or long dashes.";
+
+  int start = max(0, aiMsgCount - AI_CTX_MSGS);
+  for (int i = start; i < aiMsgCount; i++) {
+    JsonObject m = msgs.add<JsonObject>();
+    m["role"]    = aiMsgs[i].fromUser ? "user" : "assistant";
+    m["content"] = aiMsgs[i].text;
+  }
+
+  aiPendingBody = "";
+  serializeJson(doc, aiPendingBody);
+
+  aiBusy = true;
+  aiStartTask();
+  aiRequestPending = true;
+  aiFocus = 1;
+}
+
+void drawAiNoWifi(int yOffset) {
+  drawHeader(yOffset, "AI Chatbot", false);
+  display.setTextColor(SSD1306_WHITE);
+  drawCenteredText(display, "WiFi is Off!", 24 + yOffset, 1);
+  drawBoxedCenteredText(display, "OK", 44, 40 + yOffset, 40, 16, true);
+}
+
+// Lays out the whole transcript as wrapped "User: ..." / "AI: ..." lines.
+// Returns total pixel height; with draw=false it's a pure measure pass, which
+// is how both the auto-scroll target and the scroll clamp get computed.
+int aiRenderChat(int baseY, bool draw, int yOffset) {
+  int line = 0;
+  const int clipTop = 13 + yOffset;
+  const int clipBot = 49 + yOffset;
+
+  for (int m = 0; m < aiMsgCount; m++) {
+    String s = (aiMsgs[m].fromUser ? "User: " : "AI: ") + aiMsgs[m].text;
+
+    int i = 0, L = s.length();
+    while (i < L) {
+      int take = min((int)AI_WRAP_CHARS, L - i);
+
+      if (take == AI_WRAP_CHARS && (i + take) < L) {
+        int brk = -1;
+        for (int k = take - 1; k > 0; k--) {
+          if (s[i + k] == ' ') { brk = k; break; }
+        }
+        if (brk > 0) take = brk;
+      }
+
+      if (draw) {
+        int y = baseY + line * AI_LINE_H;
+        if (y >= clipTop && (y + 7) <= clipBot) {
+          display.setCursor(2, y);
+          display.print(s.substring(i, i + take));
+        }
+      }
+      i += take;
+      while (i < L && s[i] == ' ') i++;
+      line++;
+    }
+  }
+
+  if (aiBusy) {
+    if (draw) {
+      int y = baseY + line * AI_LINE_H;
+      if (y >= clipTop && (y + 7) <= clipBot) {
+        display.setCursor(2, y);
+        display.print("AI: thinking...");
+      }
+    }
+    line++;
+  }
+
+  return line * AI_LINE_H;
+}
+
+void drawAiChat(int yOffset) {
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextWrap(false);
+
+  int contentH  = aiRenderChat(0, false);
+  int maxScroll = max(0, contentH - AI_VIEW_H);
+  aiScroll = constrain(aiScroll, 0, maxScroll);
+
+  if (aiMsgCount == 0 && !aiBusy) {
+    display.setCursor(2, 23 + yOffset);
+    display.print("Ask me anything.");
+  } else {
+    aiRenderChat(AI_VIEW_TOP + yOffset - aiScroll, true, yOffset);
+  }
+
+  if (maxScroll > 0) {
+    int trackH = AI_VIEW_H;
+    int thumbH = max(4, (trackH * AI_VIEW_H) / contentH);
+    int thumbY = 13 + yOffset + ((trackH - thumbH) * aiScroll) / maxScroll;
+    display.drawFastVLine(126, 13 + yOffset, trackH, SSD1306_WHITE);
+    display.fillRect(125, thumbY, 3, thumbH, SSD1306_WHITE);
+  }
+
+  bool inputSel = (aiFocus == 1);
+  if (inputSel) { display.fillRect(0, 49 + yOffset, 94, 14, SSD1306_WHITE); display.setTextColor(SSD1306_BLACK); }
+  else          { display.drawRect(0, 49 + yOffset, 94, 14, SSD1306_WHITE); display.setTextColor(SSD1306_WHITE); }
+
+  String shown = aiInputText;
+  if (shown.length() == 0) shown = "Type msg...";
+  if (shown.length() > 15) shown = shown.substring(shown.length() - 15);
+  display.setCursor(3, 53 + yOffset);
+  display.print(shown);
+  display.setTextColor(SSD1306_WHITE);
+
+  drawBoxedCenteredText(display, "SEND", 96, 49 + yOffset, 32, 14, (aiFocus == 2));
+
+  drawHeader(yOffset, "AI Chatbot", (aiFocus == -1));
+
+  if (aiFocus == 0) {
+    display.drawRect(0, 12 + yOffset, 128, AI_VIEW_H + 1, SSD1306_WHITE);
+    if (aiScrollMode) display.drawRect(1, 13 + yOffset, 126, AI_VIEW_H - 1, SSD1306_WHITE);
+  }
+  display.setTextWrap(true);
+}
+
 void connectivityTask(void *p) {
   const char* urls[] = {
     "http://www.gstatic.com/generate_204",
@@ -1057,6 +1515,7 @@ void setup() {
   loadSettings();
   rwLoadFromFile();
   loadCredentials(); // saved WiFi SSID/password pairs -- WiFi itself stays off until asked
+  loadBatterySettings(); // watchface indicator mode (icon vs. %), survives deep sleep
 
   lastActivityTime = millis();
 }
@@ -1110,7 +1569,8 @@ void loop() {
   bool allowBlank = !isAnimating && currentScreen != SCREEN_ANIMATOR &&
                      currentScreen != SCREEN_WIFI_SCANNING &&
                      currentScreen != SCREEN_WIFI_PASSWORD &&
-                     currentScreen != SCREEN_WIFI_NTP;
+                     currentScreen != SCREEN_WIFI_NTP &&
+                     !aiBusy;
 
   if (displayOn && allowBlank) {
     if (millis() - lastActivityTime > DISPLAY_TIMEOUT_MS) {
@@ -1128,16 +1588,17 @@ void loop() {
   // Deep sleep after DEEP_SLEEP_TIMEOUT_MS of true inactivity -- but never
   // while something active is running that a full reset would silently kill:
   // a live Stopwatch/Timer, a mid-transfer Restwise sync, an in-progress
-  // slide, the Animator (a passive but deliberately continuous screen), or a
-  // WiFi scan/password-entry/connect/NTP-sync in flight. Otherwise WiFi is
-  // free to keep running through an ordinary display-off idle blank -- only
-  // deep sleep forces it off.
+  // slide, the Animator (a passive but deliberately continuous screen), a
+  // WiFi scan/password-entry/connect/NTP-sync in flight, or a pending AI
+  // reply. Otherwise WiFi is free to keep running through an ordinary
+  // display-off idle blank -- only deep sleep forces it off.
   bool allowDeepSleep = !isAnimating && currentScreen != SCREEN_ANIMATOR &&
                         !swRunning && tmMode != TM_RUNNING &&
                         rwSyncState != RWS_RECV &&
                         currentScreen != SCREEN_WIFI_SCANNING &&
                         currentScreen != SCREEN_WIFI_PASSWORD &&
-                        currentScreen != SCREEN_WIFI_NTP;
+                        currentScreen != SCREEN_WIFI_NTP &&
+                        !aiBusy;
   if (allowDeepSleep && millis() - lastActivityTime > DEEP_SLEEP_TIMEOUT_MS) {
     enterDeepSleep();
   }
@@ -1211,6 +1672,7 @@ void loop() {
             animatorSceneStart = millis();
             startAnimation(SCREEN_ANIMATOR, -64);
           } else if (menuIndex == 5) {
+            battCursor = -1;
             startAnimation(SCREEN_BATTERY, -64);
           } else if (menuIndex == 6) {
             if (WiFi.status() == WL_CONNECTED) {
@@ -1228,6 +1690,16 @@ void loop() {
               startAnimation(SCREEN_WIFI_CONFIRM, -64);
             }
           } else if (menuIndex == 7) {
+            // Stricter than AIO_Transmitter's own gate (WiFi-connected only) --
+            // this one requires real internet reachability too, not just AP
+            // association, per explicit request.
+            if (WiFi.status() == WL_CONNECTED && internetOK) {
+              aiFocus = 1; aiScrollMode = false;
+              startAnimation(SCREEN_AI_CHAT, -64);
+            } else {
+              startAnimation(SCREEN_AI_NOWIFI, -64);
+            }
+          } else if (menuIndex == 8) {
             if (pinSet) {
               pendingAction = ACT_OPEN_MENU;
               enterPinScreen(SEC_VERIFY, SCREEN_MENU);
@@ -1236,24 +1708,47 @@ void loop() {
               confirmSelection = 0;
               startAnimation(SCREEN_SECURITY_CONFIRM, -64);
             }
-          } else if (menuIndex == 8) {
+          } else if (menuIndex == 9) {
             lockSettingsCursor = -1;
             for (int i = 0; i < 4; i++) if (lockTimeoutOptions[i] == displayTimeoutSec) lockSettingsCursor = i;
             if (lockSettingsCursor == -1) lockSettingsCursor = 0;
             startAnimation(SCREEN_LOCK_SETTINGS, -64);
-          } else if (menuIndex == 9) {
+          } else if (menuIndex == 10) {
             termState = TERM_IDLE;
             termLineBuf = "";
             startAnimation(SCREEN_TERMINAL, -64);
-          } else if (menuIndex == 10) {
+          } else if (menuIndex == 11) {
             startAnimation(SCREEN_WATCHFACE, 64);
           }
         }
       }
       else if (currentScreen == SCREEN_BATTERY) {
-        // Passive read-only screen -- the back box is always focused, CENTER exits.
+        if (buttonJustPressed[0]) { if (battCursor > -1) battCursor--; }
+        if (buttonJustPressed[1]) { if (battCursor < 0) battCursor++; }
         if (buttonJustPressed[4]) {
-          startAnimation(SCREEN_MENU, 64);
+          if (battCursor == -1) {
+            startAnimation(SCREEN_MENU, 64);
+          } else {
+            battIndCursor = -1;
+            startAnimation(SCREEN_BATTERY_INDICATOR, -64);
+          }
+        }
+      }
+      else if (currentScreen == SCREEN_BATTERY_INDICATOR) {
+        if (buttonJustPressed[0]) battIndCursor = -1;
+        if (buttonJustPressed[1] && battIndCursor == -1) battIndCursor = 0;
+        if (buttonJustPressed[3]) battIndCursor = 1;
+        if (buttonJustPressed[2] && battIndCursor == 1) battIndCursor = 0;
+        if (buttonJustPressed[4]) {
+          if (battIndCursor == -1) {
+            battCursor = 0;
+            startAnimation(SCREEN_BATTERY, 64);
+          } else {
+            battShowPercent = (battIndCursor == 1);
+            saveBatterySettings();
+            battCursor = 0;
+            startAnimation(SCREEN_BATTERY, 64);
+          }
         }
       }
       else if (currentScreen == SCREEN_WIFI_CONFIRM) {
@@ -1349,7 +1844,15 @@ void loop() {
           else key = kbLower[kbCursorRow][kbCursorCol];
 
           if (strcmp(key, "EN") == 0) {
-            wifiPassword = kbInputBuffer;
+            // Enter parks the text in the input box and puts the cursor on
+            // SEND for AI Chat (so posting it is one more press, not
+            // accidental), vs. committing straight into the password field.
+            if (kbReturnScreen == SCREEN_AI_CHAT) {
+              aiInputText = kbInputBuffer;
+              aiFocus = (aiInputText.length() > 0) ? 2 : 1;
+            } else {
+              wifiPassword = kbInputBuffer;
+            }
             currentScreen = kbReturnScreen;
           } else if (strcmp(key, "CL") == 0) {
             if (kbTextCursor > 0) kbTextCursor--;
@@ -1417,6 +1920,42 @@ void loop() {
             startAnimation(SCREEN_MENU, 64);
           } else {
             startAnimation(SCREEN_WIFI_HOME, 64);
+          }
+        }
+      }
+      else if (currentScreen == SCREEN_AI_NOWIFI) {
+        if (buttonJustPressed[2] || buttonJustPressed[4]) startAnimation(SCREEN_MENU, 64);
+      }
+      else if (currentScreen == SCREEN_AI_CHAT) {
+        // Scroll mode swallows Up/Down for the transcript; center hands control back.
+        if (aiScrollMode) {
+          if (buttonJustPressed[0]) aiScroll -= AI_LINE_H;
+          if (buttonJustPressed[1]) aiScroll += AI_LINE_H;
+          if (aiScroll < 0) aiScroll = 0; // lower clamp needs render height, drawAiChat does it
+          if (buttonJustPressed[4]) aiScrollMode = false;
+        } else {
+          if (buttonJustPressed[0]) { if (aiFocus > -1) aiFocus--; }
+          if (buttonJustPressed[1]) { if (aiFocus <  2) aiFocus++; }
+          // Input and SEND sit side by side, so Left/Right moves between them.
+          if (buttonJustPressed[2]) { if (aiFocus == 2) aiFocus = 1; else if (aiFocus == 1) aiFocus = -1; }
+          if (buttonJustPressed[3]) { if (aiFocus == 1) aiFocus = 2; }
+
+          if (buttonJustPressed[4]) {
+            if (aiFocus == -1) {
+              startAnimation(SCREEN_MENU, 64);
+            } else if (aiFocus == 0) {
+              aiScrollMode = true;
+            } else if (aiFocus == 1) {
+              kbInputBuffer  = aiInputText;
+              kbTextCursor   = kbInputBuffer.length();
+              kbScrollOffset = 0;
+              currentKBMode  = KB_LOWER;
+              kbCursorRow = 0; kbCursorCol = 0;
+              kbReturnScreen = SCREEN_AI_CHAT;
+              currentScreen  = SCREEN_WIFI_KEYBOARD;
+            } else if (aiFocus == 2) {
+              aiSendMessage();
+            }
           }
         }
       }
@@ -1885,6 +2424,16 @@ void loop() {
     }
   }
 
+  // Drain a finished AI reply on the UI thread -- the network task only ever
+  // hands back a string, the transcript itself is written from here alone.
+  if (aiReplyReady) {
+    aiReplyReady = false;
+    aiBusy       = false;
+    aiAppendMsg(false, aiReplyText.length() ? aiReplyText : String("[No reply]"));
+    aiReplyText  = "";
+    lastActivityTime = millis(); // a reply counts as activity, don't sleep on it
+  }
+
   // ---- NTP sync polling -- non-blocking. The 4 query tasks run independently
   // in the background; this just checks in on them each loop tick. Waits for
   // either all 4 to finish or the 20s budget to expire, then picks the
@@ -2057,6 +2606,7 @@ void drawScreen(ScreenState screen, int yOffset) {
   else if (screen == SCREEN_GOODNIGHT) drawGoodNight(yOffset);
   else if (screen == SCREEN_ANIMATOR) drawAnimator(yOffset);
   else if (screen == SCREEN_BATTERY) drawBattery(yOffset);
+  else if (screen == SCREEN_BATTERY_INDICATOR) drawBatteryIndicator(yOffset);
   else if (screen == SCREEN_WIFI_CONFIRM) drawWifiConfirm(yOffset);
   else if (screen == SCREEN_WIFI_SCANNING) drawWifiScanning(yOffset);
   else if (screen == SCREEN_WIFI_RESULTS) drawWifiResults(yOffset);
@@ -2066,6 +2616,8 @@ void drawScreen(ScreenState screen, int yOffset) {
   else if (screen == SCREEN_WIFI_TOGGLE_CONFIRM) drawWifiToggleConfirm(yOffset);
   else if (screen == SCREEN_WIFI_FORGET_CONFIRM) drawWifiForgetConfirm(yOffset);
   else if (screen == SCREEN_WIFI_NTP) drawWifiNTP(yOffset);
+  else if (screen == SCREEN_AI_NOWIFI) drawAiNoWifi(yOffset);
+  else if (screen == SCREEN_AI_CHAT) drawAiChat(yOffset);
 }
 
 void drawHeader(int yOffset, const char* appName, bool backFocused) {
@@ -2103,7 +2655,7 @@ void drawHeader(int yOffset, const char* appName, bool backFocused) {
 void drawWatchFace(int yOffset) {
 
   drawHeader(yOffset);
-  drawBatteryIcon(128 - 18, 2 + yOffset);
+  drawBatteryStatusGlyph(128 - 2, 2 + yOffset);
   if (WiFi.status() == WL_CONNECTED) drawWifiStatusIcon(2, 2 + yOffset);
   if (internetOK) drawTowerStatusIcon(12, 2 + yOffset);
 
@@ -2715,8 +3267,30 @@ void applyTerminalCommand(bool granted) {
 /* ------------------------------ Restwise app ---------------------------- */
 
 bool isNightNow() {
-  int h = nowTime().hour();
-  return (h >= 21 || h < 6);   // 9 PM .. 6 AM
+  DateTime now = nowTime();
+  int curMin = now.hour() * 60 + now.minute();
+  int todayIdx = (now.dayOfTheWeek() + 6) % 7; // Monday-first, matches rwBlocks[].days
+
+  // If today's synced timetable has a Sleep-labeled block, that block's own
+  // window IS "night" -- overrides the static default entirely for today.
+  bool hasSleepBlockToday = false;
+  for (int i = 0; i < rwBlockCount; i++) {
+    if (!(rwBlocks[i].days & (1 << todayIdx))) continue;
+    String label = rwBlocks[i].label;
+    label.toLowerCase();
+    if (label.indexOf("sleep") < 0) continue;
+
+    hasSleepBlockToday = true;
+    int s = rwBlocks[i].startMin, e = rwBlocks[i].endMin;
+    bool inBlock = (s <= e) ? (curMin >= s && curMin < e)
+                            : (curMin >= s || curMin < e); // wraps past midnight
+    if (inBlock) return true;
+  }
+  if (hasSleepBlockToday) return false;
+
+  // No Sleep block scheduled today (or no timetable synced at all) -- default.
+  int h = now.hour();
+  return (h >= 22 || h < 6); // 10 PM .. 6 AM
 }
 
 // Day-list item -> Monday-first index (0=Mon .. 6=Sun).
