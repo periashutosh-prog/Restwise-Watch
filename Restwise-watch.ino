@@ -135,8 +135,16 @@ enum ScreenState {
 };
 ScreenState currentScreen = SCREEN_WATCHFACE;
 
-bool lastButtonStates[5] = {false, false, false, false, false};
 bool buttonJustPressed[5] = {false, false, false, false, false};
+
+// Written only by buttonTask, read by loop(). A press is latched until loop() takes it, so one
+// that lands during a slow redraw or a slide animation is still seen instead of falling between polls.
+const uint32_t BTN_SAMPLE_MS = 5;
+const uint8_t  BTN_STABLE_SAMPLES = 4;    // 4 x 5ms = a level must hold 20ms to count (also the debounce)
+const uint32_t BTN_PRESS_TTL_MS = 350;    // a latched press older than this is stale and dropped
+volatile bool btnHeld[5] = {false, false, false, false, false};
+volatile bool btnLatched[5] = {false, false, false, false, false};
+volatile uint32_t btnLatchedAt[5] = {0, 0, 0, 0, 0};
 
 enum MenuApp {
   APP_RESTWISE, APP_STOPWATCH, APP_TIMER, APP_CALCULATOR, APP_ANIMATOR, APP_BATTERY,
@@ -469,6 +477,7 @@ void drawCenteredText(Adafruit_SSD1306 &d, const String &text, int16_t y, uint8_
 void drawBoxedCenteredText(Adafruit_SSD1306 &d, const char* text, int x, int y, int w, int h, bool inverted);
 void startAnimation(ScreenState next, int targetOffset);
 void readButtons();
+bool takeButtonPress(int i);
 void drawPinEntry(int yOffset);
 void drawSecurityMenu(int yOffset);
 void drawSecurityConfirm(int yOffset);
@@ -2100,11 +2109,13 @@ void setup() {
 void loop() {
   readButtons();
 
+  // Presses stay latched while the display is off (so the wake press can be swallowed below) and
+  // during a slide animation (so they apply right after it) -- but only for BTN_PRESS_TTL_MS.
   bool activityDetected = false;
+  bool canTakePresses = displayOn && !isAnimating;
   for (int i = 0; i < 5; i++) {
-    buttonJustPressed[i] = buttonStates[i] && !lastButtonStates[i];
-    lastButtonStates[i] = buttonStates[i];
-    if (buttonStates[i]) activityDetected = true;
+    buttonJustPressed[i] = canTakePresses && takeButtonPress(i);
+    if (buttonStates[i] || btnLatched[i]) activityDetected = true;
   }
 
   if (activityDetected) {
@@ -2124,7 +2135,7 @@ void loop() {
       // stops resuming whatever screen you happened to be sitting on before.
       currentScreen = isNightNow() ? SCREEN_GOODNIGHT : SCREEN_WATCHFACE;
 
-      for (int i = 0; i < 5; i++) buttonJustPressed[i] = false;
+      for (int i = 0; i < 5; i++) { buttonJustPressed[i] = false; btnLatched[i] = false; }
     }
   }
 
@@ -3064,24 +3075,51 @@ void loop() {
 
 /* ---------------- Platform layer: buttons, time, settings ---------------- */
 
+// Priority 2 (above loopTask's 1) so sampling stays on time even while loop() is busy redrawing
+// (~26ms per frame) or other tasks are crunching TLS/NTP.
+void buttonTask(void *pv) {
+  bool state[5];
+  uint8_t diffCount[5] = {0, 0, 0, 0, 0};
+  for (int i = 0; i < 5; i++) {
+    state[i] = !digitalRead(buttonPins[i]);
+    btnHeld[i] = state[i]; // start from the real level so a button still held at boot isn't a phantom press
+  }
+
+  TickType_t last = xTaskGetTickCount();
+  for (;;) {
+    vTaskDelayUntil(&last, pdMS_TO_TICKS(BTN_SAMPLE_MS));
+    for (int i = 0; i < 5; i++) {
+      bool raw = !digitalRead(buttonPins[i]);
+      if (raw == state[i]) { diffCount[i] = 0; continue; }
+      if (++diffCount[i] >= BTN_STABLE_SAMPLES) {
+        diffCount[i] = 0;
+        state[i] = raw;
+        btnHeld[i] = raw;
+        if (raw) {
+          btnLatchedAt[i] = millis();
+          btnLatched[i] = true;
+        }
+      }
+    }
+  }
+}
+
 void setupButtons() {
   for (int i = 0; i < 5; i++) {
     pinMode(buttonPins[i], INPUT_PULLUP);
   }
+  xTaskCreate(buttonTask, "Buttons", 2048, NULL, 2, NULL);
 }
 
 void readButtons() {
-  // 50ms poll, also acting as the debounce (a bounce settles well inside one
-  // interval).
-  static unsigned long lastPoll = 0;
-  if (millis() - lastPoll < 50) return;
-  lastPoll = millis();
+  for (int i = 0; i < 5; i++) buttonStates[i] = btnHeld[i];
+}
 
-  buttonStates[0] = !digitalRead(BTN_UP);
-  buttonStates[1] = !digitalRead(BTN_DOWN);
-  buttonStates[2] = !digitalRead(BTN_LEFT);
-  buttonStates[3] = !digitalRead(BTN_RIGHT);
-  buttonStates[4] = !digitalRead(BTN_CENTER);
+bool takeButtonPress(int i) {
+  if (!btnLatched[i]) return false;
+  uint32_t at = btnLatchedAt[i];
+  btnLatched[i] = false;
+  return (millis() - at) <= BTN_PRESS_TTL_MS;
 }
 
 DateTime nowTime() {
