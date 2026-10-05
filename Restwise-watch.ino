@@ -2987,21 +2987,20 @@ void loop() {
       lastStatusUpdate = millis();
     }
 
-    // Cap the actual I2C push to the OLED at 60 FPS (~17ms). Button reads and
-    // animation stepping above still run every loop tick for responsiveness --
-    // only the expensive full-frame display.display() transfer is throttled.
-    // At the 1MHz bus speed a 60 FPS full-frame push needs ~561.6kbps, leaving
-    // ~1.78x headroom -- still comfortable, just less margin than 40 FPS had.
-    static unsigned long lastFrameTime = 0;
-    const unsigned long FRAME_INTERVAL_MS = 17; // ~1000/60
-    // The Animator lets the user pick its own cap. Animation is time-based,
-    // so a lower FPS plays at the same speed, just choppier.
-    unsigned long frameInterval = FRAME_INTERVAL_MS;
-    if (currentScreen == SCREEN_ANIMATOR && !isAnimating) {
-      frameInterval = (1000UL + animatorFps / 2) / animatorFps;
-    }
-    if (millis() - lastFrameTime >= frameInterval) {
-      lastFrameTime = millis();
+    // Frames are paced to an exact 60 FPS (16666us). The deadline advances by one period each
+    // frame instead of being reset to "now", so slow or late frames don't accumulate drift and
+    // the average rate is exactly 60. Button reads and animation stepping above still run every
+    // loop tick -- only the full-frame display.display() transfer is paced.
+    static uint32_t nextFrameUs = 0;
+    // The Animator lets the user pick its own rate. Animation is time-based, so a lower FPS
+    // plays at the same speed, just choppier.
+    uint32_t frameUs = 1000000UL / 60;
+    if (currentScreen == SCREEN_ANIMATOR && !isAnimating) frameUs = 1000000UL / animatorFps;
+    uint32_t nowUs = micros();
+    int32_t lateUs = (int32_t)(nowUs - nextFrameUs);
+    if (lateUs >= 0) {
+      if (lateUs > (int32_t)(2 * frameUs)) nextFrameUs = nowUs; // long stall: resync instead of bursting frames
+      nextFrameUs += frameUs;
       updateDisplay();
     }
   }
@@ -3081,7 +3080,7 @@ void loop() {
     }
   }
 
-  delay(5);
+  delay(1); // 5ms here put a floor of ~18ms on frame spacing; 1ms lets frames start on their deadline
 }
 
 /* ---------------- Platform layer: buttons, time, settings ---------------- */
