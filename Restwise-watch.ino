@@ -73,7 +73,12 @@ const bool WIFI_APP_ENABLED = true;
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_RESET -1
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+#define I2C_CLOCK_DISPLAY 1000000UL // see the I2C note below
+#define I2C_CLOCK_RTC     400000UL
+// The library forces its own bus speed around every frame (default 400kHz, then back to 100kHz),
+// overriding Wire.setClock(), so the real speeds have to be passed here: 1MHz during the frame
+// push, 400kHz after (what the RTC uses).
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET, I2C_CLOCK_DISPLAY, I2C_CLOCK_RTC);
 
 RTC_DS3231 rtc;
 
@@ -95,8 +100,6 @@ RTC_DS3231 rtc;
 // can't share the bus at 1MHz. Since it sits on the same SDA/SCL lines as the
 // OLED, the bus speed is switched down to 400kHz right around every RTC
 // transaction and restored afterward -- see I2C_CLOCK_DISPLAY/I2C_CLOCK_RTC.
-#define I2C_CLOCK_DISPLAY 1000000UL
-#define I2C_CLOCK_RTC     400000UL
 
 // Buttons (see wiring note above)
 #define BTN_UP     23
@@ -318,6 +321,8 @@ bool tmLongPressTriggered = false;
 bool isAnimating = false;
 int animOffsetY = 0;
 int animTargetY = 0;
+unsigned long animStartMs = 0;
+const unsigned long SLIDE_MS = 250; // screen slide duration; time-based so it doesn't depend on frame cost
 ScreenState animNextScreen = SCREEN_WATCHFACE;
 
 unsigned long lastActivityTime = 0;
@@ -2215,13 +2220,13 @@ void loop() {
   if (displayOn) {
 
     if (isAnimating) {
-      if (animOffsetY < animTargetY) animOffsetY += 8;
-      else if (animOffsetY > animTargetY) animOffsetY -= 8;
-
-      if (abs(animOffsetY - animTargetY) < 8) {
+      unsigned long slideElapsed = millis() - animStartMs;
+      if (slideElapsed >= SLIDE_MS) {
         animOffsetY = 0;
         currentScreen = animNextScreen;
         isAnimating = false;
+      } else {
+        animOffsetY = (int)((long)animTargetY * (long)slideElapsed / (long)SLIDE_MS);
       }
     } else {
 
@@ -3193,6 +3198,7 @@ void startAnimation(ScreenState next, int targetOffset) {
   animNextScreen = next;
   animOffsetY = 0;
   animTargetY = targetOffset;
+  animStartMs = millis();
 }
 
 void updateDisplay() {
