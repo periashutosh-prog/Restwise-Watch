@@ -1085,7 +1085,7 @@ const DinoCactusDef dinoCactusDefs[6] = {
   {cactusS1, 7, 15}, {cactusS2, 14, 15}, {cactusS3, 22, 15},
   {cactusL1, 10, 22}, {cactusL2, 22, 22}, {cactusL3, 33, 22}
 };
-struct DinoCactus { float x; uint8_t type; bool active; };
+struct DinoCactus { int spawnScroll; uint8_t type; bool active; }; // spawnScroll = whole-pixel scroll counter at spawn
 struct DinoBox { int8_t x0, x1, r0, r1; }; // sprite-local columns [x0,x1) and rows [r0,r1)
 const DinoBox dinoBoxes[3] = { {9, 16, 1, 6}, {1, 12, 7, 15}, {4, 11, 15, 19} }; // head, body, feet
 
@@ -1174,7 +1174,7 @@ void dinoSpawn() {
   if (cat == 1) maxSize = (dinoSpeed >= 170.0f) ? 3 : ((dinoSpeed >= 140.0f) ? 2 : 1);
   int type = cat * 3 + dinoRand(1, maxSize) - 1;
 
-  dinoCacti[slot] = {128.0f, (uint8_t)type, true};
+  dinoCacti[slot] = {(int)dinoGroundScroll, (uint8_t)type, true};
   dinoLastCat[1] = dinoLastCat[0];
   dinoLastCat[0] = cat;
 
@@ -1185,10 +1185,17 @@ void dinoSpawn() {
   dinoSpawnedAny = true;
 }
 
-bool dinoHitsCactus(int idx) { // takes an index, not the struct: Arduino hoists prototypes above type definitions
+// Ground and cacti both derive from the same whole-pixel scroll counter, so every frame they move
+// by exactly the same number of pixels and can't shimmer against each other.
+int dinoCactusX(int idx) { // takes an index, not the struct: Arduino hoists prototypes above type definitions
+  return 128 - ((int)dinoGroundScroll - dinoCacti[idx].spawnScroll);
+}
+
+bool dinoHitsCactus(int idx) {
   const DinoCactus &c = dinoCacti[idx];
   const DinoCactusDef &d = dinoCactusDefs[c.type];
-  int cx0 = (int)c.x + 1, cx1 = (int)c.x + d.w - 1; // inset 1px so empty arm corners don't count
+  int x = dinoCactusX(idx);
+  int cx0 = x + 1, cx1 = x + d.w - 1; // inset 1px so empty arm corners don't count
   int cy0 = DINO_FEET_Y - d.h + 1, cy1 = DINO_FEET_Y + 1;
   int top = DINO_FEET_Y - DINO_H + 1 - (int)(dinoY + 0.5f);
   for (int i = 0; i < 3; i++) {
@@ -1236,8 +1243,7 @@ void dinoTick() {
 
   for (int i = 0; i < DINO_MAX_CACTI; i++) {
     if (!dinoCacti[i].active) continue;
-    dinoCacti[i].x -= step;
-    if (dinoCacti[i].x + dinoCactusDefs[dinoCacti[i].type].w < 0) dinoCacti[i].active = false;
+    if (dinoCactusX(i) + dinoCactusDefs[dinoCacti[i].type].w < 0) dinoCacti[i].active = false;
   }
 
   if (!dinoSpawnedAny) {
@@ -1341,7 +1347,7 @@ void drawDino(int yOffset) {
   for (int i = 0; i < DINO_MAX_CACTI; i++) {
     if (!dinoCacti[i].active) continue;
     const DinoCactusDef &d = dinoCactusDefs[dinoCacti[i].type];
-    display.drawBitmap((int)dinoCacti[i].x, DINO_FEET_Y - d.h + 1 + yOffset, d.bmp, d.w, d.h, SSD1306_WHITE);
+    display.drawBitmap(dinoCactusX(i), DINO_FEET_Y - d.h + 1 + yOffset, d.bmp, d.w, d.h, SSD1306_WHITE);
   }
 
   const uint8_t *spr;
