@@ -70,6 +70,10 @@
 // below -- the watch is always radio-off at boot regardless.
 const bool WIFI_APP_ENABLED = true;
 
+// Name the watch shows up as on the router. Hostnames may only contain letters, digits and hyphens,
+// so no apostrophe.
+const char* const WIFI_HOSTNAME = "Ashutosh-Smartwatch";
+
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_RESET -1
@@ -2056,6 +2060,7 @@ void setup() {
   // rather than merely leaving them unused, so the chip never transmits.
   // (The ESP32-C6 has BLE in addition to WiFi, unlike the ESP8266, so both
   // get stopped explicitly here.)
+  WiFi.setHostname(WIFI_HOSTNAME); // only stores the name; applied whenever the STA interface starts, so this precedes every WiFi.begin()
   WiFi.mode(WIFI_OFF);
   btStop();
 
