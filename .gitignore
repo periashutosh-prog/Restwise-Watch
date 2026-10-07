@@ -1,6 +1,9 @@
 # Contains the real Groq API key -- never commit this. See ai_config.example.h.
 ai_config.h
 
+# Contains the real Discord bot token -- never commit this. See discord_config.example.h.
+discord_config.h
+
 # Arduino build artifacts
 build/
 *.bin

@@ -54,6 +54,7 @@
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
+#include <WebSocketsClient.h>
 #include "time.h"
 
 // Groq API key + model, kept out of the repo (ai_config.h is gitignored).
@@ -62,6 +63,14 @@
 #else
   #error "Missing ai_config.h - copy ai_config.example.h to ai_config.h and add your Groq API key."
 #endif
+
+// Discord bot token (gitignored) and the public root certificates used to verify Discord's TLS.
+#if __has_include("discord_config.h")
+  #include "discord_config.h"
+#else
+  #error "Missing discord_config.h - copy discord_config.example.h to discord_config.h and add your bot token."
+#endif
+#include "discord_roots.h"
 
 // Master switch for the "extras" that exist on the dev watch but should not
 // ship: the WiFi app (false hard-blocks the radio from ever being enabled,
@@ -138,7 +147,9 @@ enum ScreenState {
   SCREEN_WIFI_CONFIRM, SCREEN_WIFI_SCANNING, SCREEN_WIFI_RESULTS,
   SCREEN_WIFI_PASSWORD, SCREEN_WIFI_KEYBOARD, SCREEN_WIFI_HOME,
   SCREEN_WIFI_TOGGLE_CONFIRM, SCREEN_WIFI_FORGET_CONFIRM, SCREEN_WIFI_NTP,
-  SCREEN_AI_NOWIFI, SCREEN_AI_CHAT
+  SCREEN_AI_NOWIFI, SCREEN_AI_CHAT,
+  SCREEN_DISCORD_NOWIFI, SCREEN_DISCORD_LIST, SCREEN_DISCORD_ADD, SCREEN_DISCORD_DELETE, SCREEN_DISCORD_CHAT,
+  SCREEN_POWER_MENU, SCREEN_POWER_CONFIRM, SCREEN_ECO_CLOCK, SCREEN_ECO_EXIT, SCREEN_ECO_CRITICAL
 };
 ScreenState currentScreen = SCREEN_WATCHFACE;
 
@@ -146,6 +157,12 @@ bool buttonJustPressed[5] = {false, false, false, false, false};
 
 // Written only by buttonTask, read by loop(). A press is latched until loop() takes it, so one
 // that lands during a slow redraw or a slide animation is still seen instead of falling between polls.
+// Task priorities: buttons (2) > the screen/UI loop (Arduino's loopTask, 1) > every background task (0).
+// A lower number never pre-empts a higher one, so a TLS handshake, NTP sync or battery sample can only
+// run in the gaps -- e.g. while the display transfer is in flight -- and never delays a press or a frame.
+const UBaseType_t PRIO_BUTTONS = 2;
+const UBaseType_t PRIO_BACKGROUND = 0;
+
 const uint32_t BTN_SAMPLE_MS = 5;
 const uint8_t  BTN_STABLE_SAMPLES = 4;    // 4 x 5ms = a level must hold 20ms to count (also the debounce)
 const uint32_t BTN_PRESS_TTL_MS = 350;    // a latched press older than this is stale and dropped
@@ -154,11 +171,11 @@ volatile bool btnLatched[5] = {false, false, false, false, false};
 volatile uint32_t btnLatchedAt[5] = {0, 0, 0, 0, 0};
 
 enum MenuApp {
-  APP_RESTWISE, APP_STOPWATCH, APP_TIMER, APP_CALCULATOR, APP_ANIMATOR, APP_BATTERY,
-  APP_WIFI, APP_AI, APP_DINO, APP_SECURITY, APP_LOCKSCREEN, APP_TERMINAL, APP_LOCK,
+  APP_RESTWISE, APP_STOPWATCH, APP_TIMER, APP_CALCULATOR, APP_ANIMATOR, APP_BATTERY, APP_POWER,
+  APP_WIFI, APP_AI, APP_DISCORD, APP_DINO, APP_SECURITY, APP_LOCKSCREEN, APP_TERMINAL, APP_LOCK,
   NUM_MENU_APPS
 };
-const char* const menuAppNames[NUM_MENU_APPS] = {"Restwise", "Stopwatch", "Timer", "Calculator", "Animator", "Battery", "WiFi", "AI Chatbot", "Dino Game", "Security", "Lock Screen", "Terminal", "Lock"};
+const char* const menuAppNames[NUM_MENU_APPS] = {"Restwise", "Stopwatch", "Timer", "Calculator", "Animator", "Battery", "Power Mode", "WiFi", "AI Chatbot", "Discord", "Dino Game", "Security", "Lock Screen", "Terminal", "Lock"};
 int menuApps[NUM_MENU_APPS]; // visible menu rows -> MenuApp, built once in buildMenu()
 int menuCount = 0;
 int menuIndex = 0;
@@ -166,7 +183,7 @@ int menuIndex = 0;
 void buildMenu() {
   menuCount = 0;
   for (int a = 0; a < NUM_MENU_APPS; a++) {
-    if (a == APP_DINO && !WIFI_APP_ENABLED) continue;
+    if ((a == APP_DINO || a == APP_DISCORD) && !WIFI_APP_ENABLED) continue;
     menuApps[menuCount++] = a;
   }
 }
@@ -256,6 +273,7 @@ static const uint8_t PROGMEM tower_bmp[] = {
 // On-screen QWERTY keyboard (same grid/focus-nav as AIO_Transmitter's).
 enum KBMode { KB_LOWER, KB_UPPER, KB_SYMBOL };
 KBMode currentKBMode = KB_LOWER;
+bool kbShiftOnce = false; // keyboard opened capitalised: reverts to lowercase after the first character
 int kbCursorRow = 0, kbCursorCol = 0;
 String kbInputBuffer = "";
 int kbTextCursor   = 0;
@@ -815,6 +833,202 @@ void saveBatterySettings() {
   prefs.begin("batt_set", false);
   prefs.putBool("pct", battShowPercent);
   prefs.end();
+}
+
+/* ---------------------------- Power modes ---------------------------- */
+// Balanced = how the watch has always behaved. Power = never deep-sleeps, so WiFi (and Discord) stay
+// up with modem sleep. Eco = extreme: 40 MHz, 5 FPS, a time-only screen for 5 s per wake, then deep sleep.
+enum PowerMode { PM_BALANCED = 0, PM_POWER = 1, PM_ECO = 2 };
+const char* const POWER_NAMES[3] = {"Balanced Mode", "Power Mode", "Eco Mode"};
+const uint8_t POWER_TILE_MODE[3] = {PM_POWER, PM_BALANCED, PM_ECO}; // order shown in the Power Mode app
+
+const float POWER_LOW_V = 3.45f;        // ~2% on the LiPo curve: auto-switch to Eco
+const float POWER_LOW_REARM_V = 3.55f;  // that auto-switch re-arms once the cell climbs back above this
+const float POWER_CRIT_V = 3.30f;       // ~0%: battery warning, then deep sleep
+const float POWER_MIN_VALID_V = 2.5f;   // lower than this isn't a LiPo on the divider (e.g. no battery fitted)
+const unsigned long ECO_AWAKE_MS = 5000;
+const unsigned long ECO_EXIT_AWAKE_MS = 10000;
+const int ECO_EXIT_PRESSES = 5;
+
+uint8_t powerMode = PM_BALANCED, powerPrev = PM_BALANCED; // powerPrev = the mode to return to after Eco
+bool powerCrit = false;       // the last deep sleep was the critical (<3.3 V) one
+bool powerLowArmed = true;
+float powerBootV = 0.0f;
+int powerMenuCursor = 0;      // -1 back, 0..2 = tiles
+int powerConfirmCursor = 1;   // 0 YES, 1 NO
+uint8_t powerPending = PM_BALANCED;
+int ecoPressCount = 0, ecoExitCursor = 1;
+unsigned long ecoLastPressMs = 0;
+
+void powerLoad() {
+  prefs.begin("power", true);
+  powerMode = prefs.getUChar("mode", PM_BALANCED);
+  powerPrev = prefs.getUChar("prev", PM_BALANCED);
+  powerCrit = prefs.getBool("crit", false);
+  powerLowArmed = prefs.getBool("armed", true);
+  prefs.end();
+  if (powerMode > PM_ECO) powerMode = PM_BALANCED;
+  if (powerPrev > PM_ECO) powerPrev = PM_BALANCED;
+}
+
+void powerSave() {
+  prefs.begin("power", false);
+  prefs.putUChar("mode", powerMode);
+  prefs.putUChar("prev", powerPrev);
+  prefs.putBool("crit", powerCrit);
+  prefs.putBool("armed", powerLowArmed);
+  prefs.end();
+}
+
+// A direct ADC average, read before the sampling task exists (Eco never starts it).
+float powerReadBootVoltage() {
+  analogReadResolution(12);
+  analogSetPinAttenuation(PIN_BATTERY_ADC, ADC_11db);
+  uint32_t sum = 0;
+  for (int i = 0; i < 16; i++) { sum += analogReadMilliVolts(PIN_BATTERY_ADC); delay(2); }
+  return (sum / 16.0f / 1000.0f) * BATTERY_DIVIDER_RATIO;
+}
+
+// Runs on every boot/wake, before anything else is configured.
+void powerBootDecide(float v) {
+  bool changed = false;
+  bool valid = v > POWER_MIN_VALID_V;
+  if (valid && v >= POWER_LOW_REARM_V && !powerLowArmed) { powerLowArmed = true; changed = true; }
+
+  if (valid && powerCrit && v >= POWER_CRIT_V) {
+    // Charged back above critical since the last critical sleep: leave Eco and resume the mode we were
+    // in. If that mode was Eco itself there is nothing to restore -- it just keeps following Eco's rules.
+    powerCrit = false;
+    changed = true;
+    if (powerPrev != PM_ECO) powerMode = powerPrev;
+  }
+
+  if (valid && v < POWER_CRIT_V) {
+    if (powerMode != PM_ECO) powerPrev = powerMode;
+    powerMode = PM_ECO;
+    powerCrit = true;
+    powerLowArmed = false;
+    changed = true;
+  }
+  if (changed) powerSave();
+}
+
+// Eco and normal modes differ in CPU speed and radio state, so changing across that line restarts cleanly.
+void powerRestartInto(uint8_t mode, bool crit, bool disarmLow) {
+  if (mode == PM_ECO && powerMode != PM_ECO) powerPrev = powerMode;
+  powerMode = mode;
+  powerCrit = crit;
+  if (disarmLow) powerLowArmed = false;
+  powerSave();
+  delay(50);
+  ESP.restart();
+}
+
+void powerSelect(uint8_t m) {
+  if (m == powerMode) return;
+  if (m == PM_ECO) { powerRestartInto(PM_ECO, false, false); return; }
+  powerMode = m;
+  powerSave();
+  if (WiFi.getMode() != WIFI_OFF) wifiApplyRadioSettings();
+}
+
+// Once a second while awake in Balanced/Power: step down to Eco on a low cell. Needs sustained readings,
+// since a WiFi transmit burst can make the pack sag for a moment.
+void powerBatteryWatch() {
+  static unsigned long lastCheck = 0;
+  static int lowCount = 0, critCount = 0;
+  if (powerMode == PM_ECO) return;
+  if (millis() - lastCheck < 1000) return;
+  lastCheck = millis();
+  if (!batteryReadingValid || batteryCharging) { lowCount = critCount = 0; return; }
+
+  float v = batteryVoltage;
+  bool valid = v > POWER_MIN_VALID_V;
+  if (valid && v >= POWER_LOW_REARM_V && !powerLowArmed) { powerLowArmed = true; powerSave(); }
+  critCount = (valid && v < POWER_CRIT_V) ? critCount + 1 : 0;
+  lowCount  = (valid && v < POWER_LOW_V)  ? lowCount + 1  : 0;
+
+  if (critCount >= 5) powerRestartInto(PM_ECO, true, true);
+  else if (lowCount >= 10 && powerLowArmed) powerRestartInto(PM_ECO, false, true);
+}
+
+void ecoSleep() {
+  display.clearDisplay();
+  display.display(); // leave nothing in the panel's memory for the next wake
+  enterDeepSleep();
+}
+
+// Eco owns its own sleep timer: ECO_AWAKE_MS after the last button activity, then deep sleep.
+void ecoTick() {
+  if (powerMode != PM_ECO) return;
+  unsigned long limit = (currentScreen == SCREEN_ECO_EXIT) ? ECO_EXIT_AWAKE_MS : ECO_AWAKE_MS;
+  if (millis() - lastActivityTime > limit) ecoSleep();
+}
+
+void ecoHandleButtons() {
+  if (currentScreen == SCREEN_ECO_CLOCK) {
+    if (buttonJustPressed[4]) {
+      if (millis() - ecoLastPressMs > 2500) ecoPressCount = 0;
+      ecoLastPressMs = millis();
+      if (++ecoPressCount >= ECO_EXIT_PRESSES) {
+        ecoPressCount = 0;
+        ecoExitCursor = 1;
+        currentScreen = SCREEN_ECO_EXIT; // no slide: at 5 FPS it would just stutter
+      }
+    }
+  } else if (currentScreen == SCREEN_ECO_EXIT) {
+    if (buttonJustPressed[2]) ecoExitCursor = 0;
+    if (buttonJustPressed[3]) ecoExitCursor = 1;
+    if (buttonJustPressed[4]) {
+      if (ecoExitCursor == 0) powerRestartInto(powerPrev != PM_ECO ? powerPrev : PM_BALANCED, false, false);
+      else currentScreen = SCREEN_ECO_CLOCK;
+    }
+  }
+}
+
+void drawEcoExit(int yOffset) {
+  drawHeader(yOffset, "Power Mode", false);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  drawCenteredText(display, "Exit Eco Mode?", 24 + yOffset, 1);
+  drawBoxedCenteredText(display, "YES", 14, 44 + yOffset, 40, 14, (ecoExitCursor == 0));
+  drawBoxedCenteredText(display, "NO",  74, 44 + yOffset, 40, 14, (ecoExitCursor == 1));
+}
+
+// A battery that nearly fills the screen with four partitions; only the last one left blinks.
+void drawEcoCritical(int yOffset) {
+  display.drawRect(2, 6 + yOffset, 116, 52, SSD1306_WHITE);
+  display.drawRect(3, 7 + yOffset, 114, 50, SSD1306_WHITE);
+  display.fillRect(118, 20 + yOffset, 7, 24, SSD1306_WHITE); // + terminal
+  if ((millis() / 500) % 2 == 0) display.fillRect(8, 12 + yOffset, 24, 40, SSD1306_WHITE);
+}
+
+void drawPowerMenu(int yOffset) {
+  drawHeader(yOffset, "Power Mode", powerMenuCursor == -1);
+  display.setTextSize(1);
+  for (int i = 0; i < 3; i++) {
+    int y = 17 + i * 13 + yOffset;
+    bool selected = (powerMenuCursor == i);
+    if (selected) {
+      display.fillRect(0, y - 1, 128, 12, SSD1306_WHITE);
+      display.setTextColor(SSD1306_BLACK);
+    } else {
+      display.setTextColor(SSD1306_WHITE);
+    }
+    display.setCursor(4, y);
+    display.print(POWER_NAMES[POWER_TILE_MODE[i]]);
+    if (POWER_TILE_MODE[i] == powerMode) display.print(" (ON)");
+  }
+  display.setTextColor(SSD1306_WHITE);
+}
+
+void drawPowerConfirm(int yOffset) {
+  drawHeader(yOffset, "Power Mode", false);
+  display.setTextColor(SSD1306_WHITE);
+  drawCenteredText(display, "Do you want to choose", 18 + yOffset, 1);
+  drawCenteredText(display, String("\"") + POWER_NAMES[powerPending] + "\"?", 30 + yOffset, 1);
+  drawBoxedCenteredText(display, "YES", 14, 48 + yOffset, 40, 13, (powerConfirmCursor == 0));
+  drawBoxedCenteredText(display, "NO",  74, 48 + yOffset, 40, 13, (powerConfirmCursor == 1));
 }
 
 /* ---------------------------- Dino game ---------------------------- */
@@ -1386,7 +1600,1029 @@ void drawDino(int yOffset) {
   }
 }
 
+/* ---------------------------- Terminal Discord ---------------------------- */
+const int DC_MAX_CONTACTS = 20;
+const int DC_NAME_MAX = 11;                // names must be under 12 characters
+const int DC_ID_MIN = 17, DC_ID_MAX = 20;  // Discord snowflake IDs are 17-20 digits
+const char* const DC_CONTACTS_FILE = "/dc_contacts.txt";
+
+struct DcContact {
+  char name[DC_NAME_MAX + 1];
+  char userId[DC_ID_MAX + 1];
+  char dmId[DC_ID_MAX + 1];       // DM channel with the bot, filled in once first opened
+  char lastMsgId[DC_ID_MAX + 1];  // newest message already stored locally
+};
+DcContact dcContacts[DC_MAX_CONTACTS];
+int dcContactCount = 0;
+
+int dcCursor = 0;       // list: -1 back, 0 "+ Contact", 1.. = contacts
+int dcFormCursor = 0;   // add form: -1 back, 0 name, 1 id, 2 save
+int dcEditField = 0;    // which field the shared keyboard is currently editing
+int dcDeleteIdx = 0;
+int dcDeleteCursor = 1; // 0 YES, 1 NO
+String dcNewName = "", dcNewId = "";
+String dcFormError = "";
+unsigned long dcFormErrorAt = 0;
+
+// One line per contact: name|userId|dmId|lastMsgId
+void dcLoadContacts() {
+  dcContactCount = 0;
+  File f = LittleFS.open(DC_CONTACTS_FILE, "r");
+  if (!f) return;
+  while (f.available() && dcContactCount < DC_MAX_CONTACTS) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+    String parts[4];
+    int n = 0, start = 0;
+    while (n < 4) {
+      int bar = line.indexOf('|', start);
+      if (bar < 0) { parts[n++] = line.substring(start); break; }
+      parts[n++] = line.substring(start, bar);
+      start = bar + 1;
+    }
+    if (n < 2 || parts[0].length() == 0 || parts[1].length() == 0) continue;
+    DcContact &c = dcContacts[dcContactCount++];
+    strlcpy(c.name, parts[0].c_str(), sizeof(c.name));
+    strlcpy(c.userId, parts[1].c_str(), sizeof(c.userId));
+    strlcpy(c.dmId, n > 2 ? parts[2].c_str() : "", sizeof(c.dmId));
+    strlcpy(c.lastMsgId, n > 3 ? parts[3].c_str() : "", sizeof(c.lastMsgId));
+  }
+  f.close();
+}
+
+void dcSaveContacts() {
+  File f = LittleFS.open(DC_CONTACTS_FILE, "w");
+  if (!f) return;
+  for (int i = 0; i < dcContactCount; i++) {
+    f.printf("%s|%s|%s|%s\n", dcContacts[i].name, dcContacts[i].userId, dcContacts[i].dmId, dcContacts[i].lastMsgId);
+  }
+  f.close();
+}
+
+// Returns "" on success, otherwise a short message to show on the form.
+String dcAddContact(const String &nameIn, const String &idIn) {
+  String name = nameIn; name.trim();
+  String id = idIn;     id.trim();
+  if (name.length() == 0) return "Enter a name";
+  if ((int)name.length() > DC_NAME_MAX) return "Name too long";
+  if ((int)id.length() < DC_ID_MIN || (int)id.length() > DC_ID_MAX) return "ID: 17-20 digits";
+  for (int i = 0; i < (int)id.length(); i++) if (id[i] < '0' || id[i] > '9') return "ID: digits only";
+  if (dcContactCount >= DC_MAX_CONTACTS) return "Contact list full";
+  for (int i = 0; i < dcContactCount; i++) {
+    if (name.equalsIgnoreCase(dcContacts[i].name)) return "Name already used";
+    if (id == dcContacts[i].userId) return "ID already saved";
+  }
+  DcContact &c = dcContacts[dcContactCount++];
+  strlcpy(c.name, name.c_str(), sizeof(c.name));
+  strlcpy(c.userId, id.c_str(), sizeof(c.userId));
+  c.dmId[0] = 0;
+  c.lastMsgId[0] = 0;
+  dcSaveContacts();
+  return "";
+}
+
+void dcDeleteContact(int idx) {
+  if (idx < 0 || idx >= dcContactCount) return;
+  LittleFS.remove(String("/dc_") + dcContacts[idx].userId + ".log"); // that contact's stored chat, if any
+  for (int i = idx; i < dcContactCount - 1; i++) dcContacts[i] = dcContacts[i + 1];
+  dcContactCount--;
+  dcSaveContacts();
+}
+
+// The shared on-screen keyboard edits one form field at a time. IDs start in symbol mode because
+// that's the layout with a 0 key.
+void dcOpenKeyboard(int field) {
+  dcEditField = field;
+  kbInputBuffer = (field == 0) ? dcNewName : dcNewId;
+  kbTextCursor = kbInputBuffer.length();
+  if (field == 0 && kbInputBuffer.length() == 0) { currentKBMode = KB_UPPER; kbShiftOnce = true; } // names start capitalised
+  else { currentKBMode = (field == 0) ? KB_LOWER : KB_SYMBOL; kbShiftOnce = false; }
+  kbCursorRow = 0; kbCursorCol = 0;
+  kbReturnScreen = SCREEN_DISCORD_ADD;
+  currentScreen = SCREEN_WIFI_KEYBOARD;
+}
+
+void drawDiscordNoWifi(int yOffset) {
+  drawHeader(yOffset, "Discord", false);
+  display.setTextColor(SSD1306_WHITE);
+  drawCenteredText(display, "WiFi is Off!", 24 + yOffset, 1);
+  drawBoxedCenteredText(display, "OK", 44, 40 + yOffset, 40, 16, true);
+}
+
+void drawDiscordList(int yOffset) {
+  drawHeader(yOffset, "Discord", dcCursor == -1);
+  drawDiscordStatusDot(yOffset);
+  display.setTextSize(1);
+
+  int total = 1 + dcContactCount; // row 0 is "+ Contact"
+  int sel = (dcCursor < 0) ? 0 : dcCursor;
+  int startIdx = (sel < 4) ? 0 : sel - 3;
+  int endIdx = min(startIdx + 4, total);
+
+  for (int i = startIdx; i < endIdx; i++) {
+    int y = 16 + (i - startIdx) * 12 + yOffset;
+    bool selected = (i == dcCursor);
+    if (selected) {
+      display.fillRect(0, y - 1, 128, 12, SSD1306_WHITE);
+      display.setTextColor(SSD1306_BLACK);
+    } else {
+      display.setTextColor(SSD1306_WHITE);
+    }
+    display.setCursor(4, y);
+    display.print(i == 0 ? "+ Contact" : dcContacts[i - 1].name);
+    if (selected && i > 0) {
+      display.setCursor(94, y);
+      display.print("R:del");
+    }
+  }
+  display.setTextColor(SSD1306_WHITE);
+}
+
+void drawDiscordAdd(int yOffset) {
+  drawHeader(yOffset, "New Contact", dcFormCursor == -1);
+  display.setTextSize(1);
+
+  for (int r = 0; r < 2; r++) {
+    int y = 18 + r * 13 + yOffset;
+    bool selected = (dcFormCursor == r);
+    if (selected) {
+      display.fillRect(0, y - 1, 128, 12, SSD1306_WHITE);
+      display.setTextColor(SSD1306_BLACK);
+    } else {
+      display.setTextColor(SSD1306_WHITE);
+    }
+    String val = (r == 0) ? dcNewName : dcNewId;
+    if (r == 1 && val.length() > 14) val = val.substring(0, 5) + ".." + val.substring(val.length() - 7);
+    if (val.length() == 0) val = "-";
+    display.setCursor(4, y);
+    display.print(r == 0 ? "Name: " : "ID: ");
+    display.print(val);
+  }
+  display.setTextColor(SSD1306_WHITE);
+
+  if (dcFormError.length() > 0 && millis() - dcFormErrorAt > 2000) dcFormError = "";
+  if (dcFormError.length() > 0) drawCenteredText(display, dcFormError, 42 + yOffset, 1);
+
+  drawBoxedCenteredText(display, "SAVE", 34, 50 + yOffset, 60, 13, (dcFormCursor == 2));
+}
+
+void drawDiscordDelete(int yOffset) {
+  drawHeader(yOffset, "Discord", false);
+  display.setTextColor(SSD1306_WHITE);
+  drawCenteredText(display, "Delete contact?", 18 + yOffset, 1);
+  String quoted = String("\"") + (dcDeleteIdx < dcContactCount ? dcContacts[dcDeleteIdx].name : "") + "\"";
+  drawCenteredText(display, quoted, 30 + yOffset, 1);
+  drawBoxedCenteredText(display, "YES", 14, 48 + yOffset, 40, 13, (dcDeleteCursor == 0));
+  drawBoxedCenteredText(display, "NO",  74, 48 + yOffset, 40, 13, (dcDeleteCursor == 1));
+}
+
+/* ---------------------------- Discord chat ---------------------------- */
+// REST only for now: history is synced into /dc_<userId>.log on LittleFS, and a background task
+// sends messages and polls for new ones while the chat is open. One log line per message:
+//   <M|T><messageId>|<text>     (M = from the bot/"You", T = from the contact)
+const char* const DC_API = "https://discord.com/api/v10";
+const int DC_PAGE = 25;               // messages per history request (the reply is held in RAM)
+const int DC_KEEP = 500;              // newest messages indexed and shown per contact
+const int DC_TEXT_MAX = 400;          // longer messages are cut when stored
+const int DC_SEND_MAX = 200;
+const int DC_WRAP = 20;               // characters per transcript row, same as the AI chat
+const unsigned long DC_POLL_MS = 4000;
+
+enum DcUiState { DCUI_FETCH = 0, DCUI_READY = 1, DCUI_ERR = 2 };
+enum DcDone { DCD_NONE = 0, DCD_OPEN_OK, DCD_OPEN_ERR, DCD_SEND_OK, DCD_SEND_ERR, DCD_POLL_NEW };
+
+int dcChatIdx = -1;
+volatile int dcUiState = DCUI_FETCH;
+volatile int dcOpDone = DCD_NONE;
+volatile bool dcCmdOpen = false, dcSendPending = false, dcChatActive = false, dcAbort = false, dcBusy = false;
+volatile int dcFetchCount = 0;
+volatile uint32_t dcGen = 0;          // bumped on every open/leave so a stale task result is ignored
+bool dcSending = false, dcTaskStarted = false, dcScrollMode = false;
+String dcSendText = "", dcOpErr = "", dcInputText = "", dcBanner = "";
+unsigned long dcBannerAt = 0;
+int dcFocus = 1;                      // -1 back, 0 transcript, 1 input box, 2 SEND
+int dcScroll = 0, dcErrCursor = 0;
+
+uint32_t dcMsgOff[DC_KEEP];           // byte offset of each message's text in the log
+uint16_t dcMsgLen[DC_KEEP];
+uint8_t  dcMsgRows[DC_KEEP];          // wrapped rows, label included
+bool     dcMsgMine[DC_KEEP];
+int dcMsgCount = 0, dcTotalRows = 0;
+
+// The gateway (a WebSocket to Discord) is what makes the bot show as online and pushes new-message events.
+volatile bool dcGwWanted = false, dcGwConnected = false, dcGwStop = false, dcGwActive = false;
+volatile bool dcPollNow = false;       // set by the gateway when a message arrives in the open chat
+volatile int dcPresenceWanted = 0;     // 1 = online (green, in the Discord app), 0 = idle (yellow moon, anywhere else)
+volatile int dcPresenceSent = -1;
+bool dcGwTaskStarted = false;
+unsigned long dcGwNotBefore = 0;
+
+// Cache of the rows currently on screen, so drawing doesn't re-read the log file from flash every frame.
+const int DC_VIEW_ROWS = 5;
+String dcViewRow[DC_VIEW_ROWS];
+int dcViewR0 = -1;
+uint32_t dcViewGen = 0, dcIndexGen = 0;
+bool dcViewSending = false;
+
+String dcMsgPath(int idx) { return String("/dc_") + dcContacts[idx].userId + ".log"; }
+
+String dcLabel(bool mine) { return (mine ? String("You") : String(dcContacts[dcChatIdx].name)) + ": "; }
+
+// Word-wraps s to DC_WRAP columns exactly like the AI chat does. starts/lens may be null to just count.
+int dcWrapRows(const String &s, int *starts, int *lens, int maxRows) {
+  int rows = 0, i = 0, L = s.length();
+  while (i < L) {
+    int take = min(DC_WRAP, L - i);
+    if (take == DC_WRAP && (i + take) < L) {
+      int brk = -1;
+      for (int k = take - 1; k > 0; k--) if (s[i + k] == ' ') { brk = k; break; }
+      if (brk > 0) take = brk;
+    }
+    if (starts && rows < maxRows) { starts[rows] = i; lens[rows] = take; }
+    rows++;
+    i += take;
+    while (i < L && s[i] == ' ') i++;
+  }
+  return rows;
+}
+
+// Keeps only the newest DC_KEEP lines once a log has grown well past that.
+void dcCompactLog(int idx, int totalLines) {
+  String path = dcMsgPath(idx), tmp = "/dc_tmp.log";
+  File in = LittleFS.open(path, "r");
+  if (!in) return;
+  File out = LittleFS.open(tmp, "w");
+  if (!out) { in.close(); return; }
+  int skip = totalLines - DC_KEEP, n = 0;
+  while (in.available()) {
+    String line = in.readStringUntil('\n');
+    if (line.length() < 4) continue;
+    if (n++ < skip) continue;
+    out.print(line);
+    out.print('\n');
+  }
+  in.close();
+  out.close();
+  LittleFS.remove(path);
+  LittleFS.rename(tmp, path);
+}
+
+int dcScanLog() {
+  dcMsgCount = 0;
+  int lines = 0;
+  File f = LittleFS.open(dcMsgPath(dcChatIdx), "r");
+  if (!f) return 0;
+  while (f.available()) {
+    uint32_t lineStart = f.position();
+    String line = f.readStringUntil('\n');
+    int bar = line.indexOf('|');
+    if (line.length() < 4 || bar < 0) continue;
+    lines++;
+    if (dcMsgCount == DC_KEEP) {
+      memmove(dcMsgOff, dcMsgOff + 1, (DC_KEEP - 1) * sizeof(dcMsgOff[0]));
+      memmove(dcMsgLen, dcMsgLen + 1, (DC_KEEP - 1) * sizeof(dcMsgLen[0]));
+      memmove(dcMsgRows, dcMsgRows + 1, (DC_KEEP - 1) * sizeof(dcMsgRows[0]));
+      memmove(dcMsgMine, dcMsgMine + 1, (DC_KEEP - 1) * sizeof(dcMsgMine[0]));
+      dcMsgCount--;
+    }
+    String text = line.substring(bar + 1);
+    bool mine = (line[0] == 'M');
+    int rows = dcWrapRows(dcLabel(mine) + text, nullptr, nullptr, 0);
+    dcMsgOff[dcMsgCount] = lineStart + bar + 1;
+    dcMsgLen[dcMsgCount] = text.length();
+    dcMsgRows[dcMsgCount] = (uint8_t)min(rows, 255);
+    dcMsgMine[dcMsgCount] = mine;
+    dcMsgCount++;
+  }
+  f.close();
+  dcTotalRows = 0;
+  for (int i = 0; i < dcMsgCount; i++) dcTotalRows += dcMsgRows[i];
+  return lines;
+}
+
+void dcLoadIndex() {
+  int lines = dcScanLog();
+  if (lines > DC_KEEP * 2) {
+    dcCompactLog(dcChatIdx, lines);
+    dcScanLog();
+  }
+  dcIndexGen++;
+}
+
+String dcReadText(File &f, int i) {
+  char buf[DC_TEXT_MAX + 1];
+  int len = min((int)dcMsgLen[i], DC_TEXT_MAX);
+  f.seek(dcMsgOff[i]);
+  size_t n = f.readBytes(buf, len);
+  buf[n] = 0;
+  return String(buf);
+}
+
+// TLS verification needs a real date. The system clock isn't kept by the DS3231 on its own, so seed
+// it from the RTC. Must run on the UI thread: the RTC shares the I2C bus with the display.
+void dcSyncSystemClock() {
+  if (time(nullptr) > 1735689600) return; // already after 2025-01-01, i.e. valid
+  DateTime n = nowTime();
+  struct timeval tv = { (time_t)(n.unixtime() - NTP_GMT_OFFSET_SEC), 0 };
+  settimeofday(&tv, nullptr);
+}
+
+bool dcIdGreater(const char* a, const char* b) {
+  size_t la = strlen(a), lb = strlen(b);
+  if (la != lb) return la > lb;
+  return strcmp(a, b) > 0;
+}
+
+String dcErrorText(int code, const String &resp) {
+  JsonDocument d;
+  int jc = 0;
+  if (!deserializeJson(d, resp)) jc = d["code"] | 0;
+  if (jc == 50007) return "Watch: You and the user need a common server :)";
+  if (code == 401) return "Bad bot token (401)";
+  if (jc == 10013 || jc == 10003 || code == 404) return "Unknown user ID";
+  if (jc == 50001 || jc == 50013) return "Discord says: no access";
+  if (code == 429) return "Rate limited, try again soon";
+  if (code <= 0) return "Can't reach Discord. WiFi or clock?";
+  return String("Discord error ") + code;
+}
+
+// One REST call on the task's persistent TLS connection (kept alive between calls). Retries once
+// after a 429 if Discord says how long to wait.
+int dcHttp(const char* method, const String &path, const String &body, String &resp) {
+  static WiFiClientSecure client;
+  static bool ready = false;
+  if (!ready) {
+    client.setCACert(DISCORD_ROOT_CAS);
+    client.setTimeout(15000);
+    ready = true;
+  }
+  for (int attempt = 0; attempt < 2; attempt++) {
+    if (WiFi.status() != WL_CONNECTED) return -100;
+    HTTPClient http;
+    http.setConnectTimeout(10000);
+    http.setTimeout(15000);
+    if (!http.begin(client, String(DC_API) + path)) return -101;
+    http.addHeader("Authorization", String("Bot ") + DISCORD_BOT_TOKEN);
+    http.addHeader("User-Agent", "DiscordBot (https://github.com/periashutosh-prog/Restwise-Watch, 1.0)");
+    http.addHeader("Content-Type", "application/json");
+    int code = (method[0] == 'P') ? http.POST(body) : http.GET();
+    resp = (code > 0) ? http.getString() : String();
+    http.end();
+    if (code != 429) {
+      if (code < 0) {
+        char err[100];
+        client.lastError(err, sizeof(err));
+        Serial.printf("[DC] request failed: %d %s\n", code, err);
+        client.stop();
+      }
+      return code;
+    }
+    JsonDocument d;
+    float wait = 1.0f;
+    if (!deserializeJson(d, resp)) wait = d["retry_after"] | 1.0f;
+    vTaskDelay(pdMS_TO_TICKS((int)constrain(wait * 1000.0f, 200.0f, 6000.0f)));
+  }
+  return 429;
+}
+
+// Pulls every message after lastMsgId (from the very start if there is none) into the log, oldest
+// first. Returns how many were added, or -1 on failure.
+int dcSyncHistory(int idx, bool reportErr) {
+  String after = dcContacts[idx].lastMsgId[0] ? String(dcContacts[idx].lastMsgId) : String("0");
+  int added = 0;
+  for (;;) {
+    if (dcAbort) return -1;
+    String resp;
+    int code = dcHttp("GET", String("/channels/") + dcContacts[idx].dmId + "/messages?limit=" + DC_PAGE + "&after=" + after, "", resp);
+    if (code != 200) {
+      if (reportErr) dcOpErr = dcErrorText(code, resp);
+      return -1;
+    }
+
+    JsonDocument filter;
+    filter[0]["id"] = true;
+    filter[0]["content"] = true;
+    filter[0]["author"]["id"] = true;
+    JsonDocument doc;
+    if (deserializeJson(doc, resp, DeserializationOption::Filter(filter))) {
+      if (reportErr) dcOpErr = "Bad reply from Discord";
+      return -1;
+    }
+    JsonArray arr = doc.as<JsonArray>();
+    int n = min((int)arr.size(), DC_PAGE);
+    if (n == 0) break;
+
+    // Pages are not guaranteed to arrive in one order, so sort by message ID (oldest first).
+    int ord[DC_PAGE];
+    for (int i = 0; i < n; i++) ord[i] = i;
+    for (int a = 1; a < n; a++) {
+      int key = ord[a], b = a - 1;
+      while (b >= 0 && dcIdGreater(arr[ord[b]]["id"] | "", arr[key]["id"] | "")) { ord[b + 1] = ord[b]; b--; }
+      ord[b + 1] = key;
+    }
+
+    File f = LittleFS.open(dcMsgPath(idx), "a");
+    if (!f) {
+      if (reportErr) dcOpErr = "Storage error";
+      return -1;
+    }
+    for (int k = 0; k < n; k++) {
+      JsonObject m = arr[ord[k]];
+      const char* id = m["id"] | "";
+      const char* content = m["content"] | "";
+      const char* author = m["author"]["id"] | "";
+      bool mine = strcmp(author, dcContacts[idx].userId) != 0;
+      String text = aiToAscii(String(content));
+      if (text.length() == 0) text = "[attachment]";
+      if ((int)text.length() > DC_TEXT_MAX) text = text.substring(0, DC_TEXT_MAX);
+      f.print(mine ? "M" : "T");
+      f.print(id);
+      f.print('|');
+      f.print(text);
+      f.print('\n');
+      if (k == n - 1) {
+        strlcpy(dcContacts[idx].lastMsgId, id, sizeof(dcContacts[idx].lastMsgId));
+        after = String(id);
+      }
+    }
+    f.close();
+    added += n;
+    dcFetchCount = added;
+    dcSaveContacts();
+    if (n < DC_PAGE) break;
+    vTaskDelay(pdMS_TO_TICKS(120));
+  }
+  return added;
+}
+
+void dcRunOpen() {
+  int idx = dcChatIdx;
+  uint32_t gen = dcGen;
+  dcOpErr = "";
+  int done = DCD_OPEN_ERR;
+
+  bool haveDm = dcContacts[idx].dmId[0] != 0;
+  if (!haveDm) {
+    String resp;
+    String body = String("{\"recipient_id\":\"") + dcContacts[idx].userId + "\"}";
+    int code = dcHttp("POST", "/users/@me/channels", body, resp);
+    if (code == 200) {
+      JsonDocument d;
+      if (!deserializeJson(d, resp) && d["id"].is<const char*>()) {
+        strlcpy(dcContacts[idx].dmId, d["id"], sizeof(dcContacts[idx].dmId));
+        dcSaveContacts();
+        haveDm = true;
+      } else {
+        dcOpErr = "Bad reply from Discord";
+      }
+    } else {
+      dcOpErr = dcErrorText(code, resp);
+    }
+  }
+  if (haveDm && dcSyncHistory(idx, true) >= 0) done = DCD_OPEN_OK;
+
+  if (gen == dcGen) dcOpDone = done;
+}
+
+void dcRunSend() {
+  int idx = dcChatIdx;
+  uint32_t gen = dcGen;
+  String body;
+  {
+    JsonDocument d;
+    d["content"] = dcSendText;
+    serializeJson(d, body);
+  }
+  String resp;
+  int code = dcHttp("POST", String("/channels/") + dcContacts[idx].dmId + "/messages", body, resp);
+  int done;
+  if (code == 200 || code == 201) {
+    // Re-sync instead of appending our own copy: anything the contact said in the meantime lands
+    // first, in order, and lastMsgId can never skip past a message we haven't stored.
+    dcSyncHistory(idx, false);
+    done = DCD_SEND_OK;
+  } else {
+    dcOpErr = dcErrorText(code, resp);
+    done = DCD_SEND_ERR;
+  }
+  if (gen == dcGen) dcOpDone = done;
+}
+
+void dcRunPoll() {
+  int idx = dcChatIdx;
+  uint32_t gen = dcGen;
+  if (dcSyncHistory(idx, false) > 0 && gen == dcGen) dcOpDone = DCD_POLL_NEW;
+}
+
+void dcTask(void *p) {
+  unsigned long lastPoll = 0;
+  for (;;) {
+    // The TLS handshake is a second or two of solid CPU: never start one mid-slide.
+    if (dcCmdOpen && !isAnimating) {
+      dcCmdOpen = false;
+      dcBusy = true;
+      dcRunOpen();
+      dcBusy = false;
+      lastPoll = millis();
+    } else if (dcSendPending) {
+      dcSendPending = false;
+      dcBusy = true;
+      dcRunSend();
+      dcBusy = false;
+      lastPoll = millis();
+    } else if (dcChatActive && dcUiState == DCUI_READY &&
+               (dcPollNow || millis() - lastPoll > (dcGwConnected ? 30000UL : DC_POLL_MS))) {
+      // With the gateway up, polling is only a safety net; a pushed message sets dcPollNow instead.
+      dcPollNow = false;
+      dcRunPoll();
+      lastPoll = millis();
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
+void dcStartOpen() {
+  dcGen++;
+  dcOpDone = DCD_NONE;
+  dcUiState = DCUI_FETCH;
+  dcFetchCount = 0;
+  dcOpErr = "";
+  dcAbort = false;
+  dcChatActive = true;
+  dcCmdOpen = true;
+  if (!dcTaskStarted) {
+    dcTaskStarted = true;
+    // Priority 0 (below the UI's 1): the screen and buttons always pre-empt network work, which only
+    // runs in the gaps (e.g. while the display transfer is in flight). Big stack for TLS + JSON.
+    xTaskCreate(dcTask, "Discord", 14336, NULL, PRIO_BACKGROUND, NULL);
+  }
+}
+
+void dcOpenChat(int contactIdx) {
+  dcChatIdx = contactIdx;
+  dcInputText = ""; dcBanner = ""; dcSending = false;
+  dcFocus = 1; dcScroll = 0; dcScrollMode = false; dcErrCursor = 0;
+  dcMsgCount = 0; dcTotalRows = 0; dcViewR0 = -1;
+  dcSyncSystemClock();
+  dcStartOpen();
+  startAnimation(SCREEN_DISCORD_CHAT, -64);
+}
+
+void dcLeaveChat() {
+  dcChatActive = false;
+  dcAbort = true;
+  dcGen++;
+  dcSending = false;
+  startAnimation(SCREEN_DISCORD_LIST, 64);
+}
+
+void dcSendMessage() {
+  if (dcSending || dcSendPending || dcInputText.length() == 0) return;
+  dcSendText = dcInputText;
+  dcInputText = "";
+  dcFocus = 1;
+  dcSending = true;
+  dcSendPending = true;
+}
+
+bool dcChatVisible() {
+  return currentScreen == SCREEN_DISCORD_CHAT ||
+         (currentScreen == SCREEN_WIFI_KEYBOARD && kbReturnScreen == SCREEN_DISCORD_CHAT) ||
+         (isAnimating && animNextScreen == SCREEN_DISCORD_CHAT);
+}
+
+bool dcIsDiscordScreen(ScreenState s) {
+  return s == SCREEN_DISCORD_NOWIFI || s == SCREEN_DISCORD_LIST || s == SCREEN_DISCORD_ADD ||
+         s == SCREEN_DISCORD_DELETE || s == SCREEN_DISCORD_CHAT;
+}
+
+bool dcAppVisible() {
+  return dcIsDiscordScreen(currentScreen) ||
+         (currentScreen == SCREEN_WIFI_KEYBOARD && (kbReturnScreen == SCREEN_DISCORD_CHAT || kbReturnScreen == SCREEN_DISCORD_ADD)) ||
+         (isAnimating && dcIsDiscordScreen(animNextScreen));
+}
+
+// Called every loop tick on the UI thread: applies whatever the network task finished.
+void dcUpdate() {
+  // Green while you're inside the Discord app, yellow moon the moment you leave it.
+  dcPresenceWanted = dcAppVisible() ? 1 : 0;
+
+  // Waking from a blank lands on the watchface -- stop polling for a chat nobody is looking at.
+  if (dcChatActive && !dcChatVisible()) { dcChatActive = false; dcAbort = true; dcGen++; dcSending = false; }
+
+  int d = dcOpDone;
+  if (d == DCD_NONE) return;
+  dcOpDone = DCD_NONE;
+  int maxScroll;
+  switch (d) {
+    case DCD_OPEN_OK:
+      dcLoadIndex();
+      dcScroll = 100000; // clamped to the newest message when drawn
+      dcUiState = DCUI_READY;
+      lastActivityTime = millis();
+      break;
+    case DCD_OPEN_ERR:
+      dcErrCursor = 0;
+      dcUiState = DCUI_ERR;
+      lastActivityTime = millis();
+      break;
+    case DCD_SEND_OK:
+      dcSending = false;
+      dcLoadIndex();
+      dcScroll = 100000;
+      lastActivityTime = millis();
+      break;
+    case DCD_SEND_ERR:
+      dcSending = false;
+      dcInputText = dcSendText; // give the text back so it isn't lost
+      dcFocus = 2;
+      dcBanner = dcOpErr;
+      dcBannerAt = millis();
+      lastActivityTime = millis();
+      break;
+    case DCD_POLL_NEW:
+      maxScroll = max(0, dcTotalRows * AI_LINE_H - AI_VIEW_H);
+      if (dcScroll >= maxScroll - 1) dcScroll = 100000; // was at the bottom: follow new messages
+      dcLoadIndex();
+      break;
+  }
+}
+
+void dcHandleButtons() {
+  if (dcUiState == DCUI_FETCH) {
+    if (buttonJustPressed[4] || buttonJustPressed[2]) dcLeaveChat(); // cancel
+    return;
+  }
+  if (dcUiState == DCUI_ERR) {
+    if (buttonJustPressed[2]) dcErrCursor = 0;
+    if (buttonJustPressed[3]) dcErrCursor = 1;
+    if (buttonJustPressed[4]) {
+      if (dcErrCursor == 1) dcStartOpen();
+      else dcLeaveChat();
+    }
+    return;
+  }
+
+  if (dcScrollMode) {
+    if (buttonJustPressed[0]) dcScroll -= AI_LINE_H;
+    if (buttonJustPressed[1]) dcScroll += AI_LINE_H;
+    if (dcScroll < 0) dcScroll = 0;
+    if (buttonJustPressed[4]) dcScrollMode = false;
+  } else {
+    if (buttonJustPressed[0]) { if (dcFocus > -1) dcFocus--; }
+    if (buttonJustPressed[1]) { if (dcFocus < 2) dcFocus++; }
+    if (buttonJustPressed[2]) { if (dcFocus == 2) dcFocus = 1; else if (dcFocus == 1) dcFocus = -1; }
+    if (buttonJustPressed[3]) { if (dcFocus == 1) dcFocus = 2; }
+    if (buttonJustPressed[4]) {
+      if (dcFocus == -1) {
+        dcLeaveChat();
+      } else if (dcFocus == 0) {
+        dcScrollMode = true;
+      } else if (dcFocus == 1) {
+        kbInputBuffer = dcInputText;
+        kbTextCursor = kbInputBuffer.length();
+        kbScrollOffset = 0;
+        kbShiftOnce = (kbInputBuffer.length() == 0); // an empty message starts capitalised
+        currentKBMode = kbShiftOnce ? KB_UPPER : KB_LOWER;
+        kbCursorRow = 0; kbCursorCol = 0;
+        kbReturnScreen = SCREEN_DISCORD_CHAT;
+        currentScreen = SCREEN_WIFI_KEYBOARD;
+      } else if (dcFocus == 2) {
+        dcSendMessage();
+      }
+    }
+  }
+}
+
+/* ---- Discord gateway (WebSocket) ---- */
+// Connects when you first open the Discord app and stays up until deep sleep. Intents are DM-only
+// (4096), which keeps Discord's login payload tiny -- full guild data would overflow the watch's RAM.
+WebSocketsClient dcWs;
+uint32_t dcGwHbInterval = 41250, dcGwNextHb = 0, dcGwPresenceAt = 0, dcGwRetryAt = 0, dcGwBackoff = 5000;
+long dcGwSeq = -1;
+bool dcGwIdentified = false, dcGwAckOk = true;
+
+void dcGwSendHeartbeat() {
+  String s = String("{\"op\":1,\"d\":") + (dcGwSeq >= 0 ? String(dcGwSeq) : String("null")) + "}";
+  dcWs.sendTXT(s);
+  dcGwAckOk = false;
+}
+
+void dcGwSendPresence() {
+  String s = String("{\"op\":3,\"d\":{\"since\":null,\"activities\":[],\"afk\":") +
+             (dcPresenceWanted ? "false" : "true") + ",\"status\":\"" +
+             (dcPresenceWanted ? "online" : "idle") + "\"}}";
+  dcWs.sendTXT(s);
+  dcPresenceSent = dcPresenceWanted;
+  dcGwPresenceAt = millis();
+}
+
+void dcGwIdentify() {
+  JsonDocument d;
+  d["op"] = 2;
+  JsonObject dd = d["d"].to<JsonObject>();
+  dd["token"] = DISCORD_BOT_TOKEN;
+  dd["intents"] = 4096; // DIRECT_MESSAGES
+  JsonObject props = dd["properties"].to<JsonObject>();
+  props["os"] = "esp32";
+  props["browser"] = "restwise-watch";
+  props["device"] = "restwise-watch";
+  JsonObject pres = dd["presence"].to<JsonObject>();
+  pres["status"] = dcPresenceWanted ? "online" : "idle";
+  pres["afk"] = !dcPresenceWanted;
+  pres["since"] = nullptr;
+  pres["activities"].to<JsonArray>();
+  String s;
+  serializeJson(d, s);
+  dcWs.sendTXT(s);
+  dcPresenceSent = dcPresenceWanted;
+  dcGwPresenceAt = millis();
+  dcGwIdentified = true;
+}
+
+void dcGwHandleFrame(uint8_t *payload, size_t length) {
+  JsonDocument filter;
+  filter["op"] = true;
+  filter["t"] = true;
+  filter["s"] = true;
+  filter["d"]["heartbeat_interval"] = true;
+  filter["d"]["channel_id"] = true;
+  JsonDocument doc;
+  if (deserializeJson(doc, payload, length, DeserializationOption::Filter(filter))) return;
+
+  int op = doc["op"] | -1;
+  long seq = doc["s"] | -1L;
+  if (seq >= 0) dcGwSeq = seq;
+
+  switch (op) {
+    case 10: // HELLO: start beating, then log in
+      dcGwHbInterval = doc["d"]["heartbeat_interval"] | 41250;
+      dcGwNextHb = millis() + (uint32_t)(dcGwHbInterval * (esp_random() % 1000) / 1000.0f);
+      dcGwAckOk = true;
+      dcGwIdentify();
+      break;
+    case 11: // heartbeat acknowledged
+      dcGwAckOk = true;
+      break;
+    case 1:  // server asks for an immediate heartbeat
+      dcGwSendHeartbeat();
+      break;
+    case 7:  // reconnect requested
+    case 9:  // invalid session
+      dcWs.disconnect();
+      break;
+    case 0: {
+      const char* t = doc["t"] | "";
+      if (!strcmp(t, "READY")) {
+        dcGwConnected = true;
+        dcGwBackoff = 5000;
+        Serial.printf("[DC] gateway ready, free heap %u\n", (unsigned)ESP.getFreeHeap());
+      } else if (!strcmp(t, "MESSAGE_CREATE")) {
+        const char* ch = doc["d"]["channel_id"] | "";
+        if (dcChatActive && dcChatIdx >= 0 && !strcmp(ch, dcContacts[dcChatIdx].dmId)) dcPollNow = true;
+      }
+      break;
+    }
+  }
+}
+
+void dcWsEvent(WStype_t type, uint8_t *payload, size_t length) {
+  switch (type) {
+    case WStype_CONNECTED:
+      dcGwIdentified = false;
+      dcGwConnected = false;
+      dcGwSeq = -1;
+      break;
+    case WStype_DISCONNECTED:
+      dcGwConnected = false;
+      dcGwIdentified = false;
+      dcPresenceSent = -1;
+      // Back off before the library reconnects: every successful login counts against Discord's
+      // 1000-per-day limit, so a refusing server must not be hammered.
+      dcGwRetryAt = millis() + dcGwBackoff;
+      dcGwBackoff = min(dcGwBackoff * 2, (uint32_t)60000);
+      break;
+    case WStype_TEXT:
+      dcGwHandleFrame(payload, length);
+      break;
+    default:
+      break;
+  }
+}
+
+void dcGwTask(void *p) {
+  bool begun = false;
+  for (;;) {
+    if (dcGwStop) {
+      if (begun) {
+        dcWs.disconnect(); // sends a close frame, so the bot drops off Discord immediately
+        for (int i = 0; i < 20; i++) { dcWs.loop(); vTaskDelay(pdMS_TO_TICKS(10)); }
+        begun = false;
+      }
+      dcGwConnected = false;
+      dcPresenceSent = -1;
+      dcGwActive = false;
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
+
+    if (!dcGwWanted || WiFi.status() != WL_CONNECTED) {
+      if (begun) {
+        dcWs.disconnect();
+        begun = false;
+        dcGwConnected = false;
+        dcPresenceSent = -1;
+        dcGwActive = false;
+      }
+      vTaskDelay(pdMS_TO_TICKS(200));
+      continue;
+    }
+
+    if (!begun) {
+      // Same rule as the REST task: no TLS handshake during a slide animation.
+      if (isAnimating || millis() < dcGwNotBefore) { vTaskDelay(pdMS_TO_TICKS(100)); continue; }
+      dcWs.onEvent(dcWsEvent);
+      dcWs.setReconnectInterval(15000);
+      dcWs.beginSslWithCA("gateway.discord.gg", 443, "/?v=10&encoding=json", DISCORD_ROOT_CAS);
+      dcGwRetryAt = 0;
+      dcGwBackoff = 5000;
+      begun = true;
+      dcGwActive = true;
+    }
+
+    if ((int32_t)(millis() - dcGwRetryAt) >= 0) dcWs.loop();
+
+    if (dcWs.isConnected() && dcGwIdentified) {
+      uint32_t now = millis();
+      if ((int32_t)(now - dcGwNextHb) >= 0) {
+        if (!dcGwAckOk) {
+          dcWs.disconnect(); // no reply to the last beat: the connection is dead, start over
+        } else {
+          dcGwSendHeartbeat();
+          dcGwNextHb += dcGwHbInterval;
+        }
+      }
+      // Status changes are throttled by Discord, so never send them faster than every 4 s.
+      if (dcGwConnected && dcPresenceWanted != dcPresenceSent && now - dcGwPresenceAt >= 4000) dcGwSendPresence();
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+void dcGatewayRequest() {
+  if (dcGwWanted) return; // already requested; the task reconnects by itself until deep sleep
+  dcSyncSystemClock(); // TLS verification needs a real date
+  dcGwWanted = true;
+  dcGwNotBefore = millis() + 400;
+  if (!dcGwTaskStarted) {
+    dcGwTaskStarted = true;
+    xTaskCreate(dcGwTask, "DiscordGW", 10240, NULL, PRIO_BACKGROUND, NULL);
+  }
+}
+
+// Close the connection cleanly before deep sleep so the bot goes offline at once instead of lingering.
+void dcGatewayShutdown() {
+  if (!dcGwActive) return;
+  dcGwStop = true;
+  unsigned long t0 = millis();
+  while (dcGwActive && millis() - t0 < 1500) delay(10);
+}
+
+// Rebuilds the cached on-screen rows starting at transcript row r0.
+void dcRebuildView(int r0) {
+  for (int i = 0; i < DC_VIEW_ROWS; i++) dcViewRow[i] = "";
+  File f;
+  bool opened = false;
+  int row = 0;
+  for (int m = 0; m < dcMsgCount; m++) {
+    int rowsM = dcMsgRows[m];
+    if (row + rowsM <= r0) { row += rowsM; continue; }
+    if (row >= r0 + DC_VIEW_ROWS) break;
+    if (!opened) { f = LittleFS.open(dcMsgPath(dcChatIdx), "r"); opened = true; }
+    String full = dcLabel(dcMsgMine[m]) + dcReadText(f, m);
+    int starts[32], lens[32];
+    int n = dcWrapRows(full, starts, lens, 32);
+    for (int k = 0; k < n && k < 32; k++) {
+      int r = row + k;
+      if (r >= r0 && r < r0 + DC_VIEW_ROWS) dcViewRow[r - r0] = full.substring(starts[k], starts[k] + lens[k]);
+    }
+    row += rowsM;
+  }
+  if (opened) f.close();
+  if (dcSending && row >= r0 && row < r0 + DC_VIEW_ROWS) dcViewRow[row - r0] = "You: sending...";
+}
+
+// Small dot at the right of the header: filled = the bot currently shows as online on Discord.
+void drawDiscordStatusDot(int yOffset) {
+  if (dcGwConnected && dcPresenceSent == 1) display.fillCircle(120, 6 + yOffset, 2, SSD1306_WHITE);
+  else display.drawCircle(120, 6 + yOffset, 2, SSD1306_WHITE);
+}
+
+void drawDiscordChat(int yOffset) {
+  drawHeader(yOffset, dcContacts[dcChatIdx].name, dcFocus == -1 && dcUiState == DCUI_READY);
+  drawDiscordStatusDot(yOffset);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextWrap(false);
+
+  if (dcUiState == DCUI_FETCH) {
+    display.drawRect(14, 22 + yOffset, 100, 30, SSD1306_WHITE);
+    if (dcFetchCount > 0) {
+      drawCenteredText(display, "Fetching...", 29 + yOffset, 1);
+      drawCenteredText(display, String(dcFetchCount) + " messages", 40 + yOffset, 1);
+    } else {
+      drawCenteredText(display, "Fetching...", 33 + yOffset, 1);
+    }
+    display.setTextWrap(true);
+    return;
+  }
+
+  if (dcUiState == DCUI_ERR) {
+    int starts[8], lens[8];
+    int n = dcWrapRows(dcOpErr, starts, lens, 8);
+    for (int k = 0; k < n && k < 4; k++) {
+      drawCenteredText(display, dcOpErr.substring(starts[k], starts[k] + lens[k]), 16 + k * 9 + yOffset, 1);
+    }
+    drawBoxedCenteredText(display, "BACK", 14, 48 + yOffset, 40, 13, (dcErrCursor == 0));
+    drawBoxedCenteredText(display, "RETRY", 74, 48 + yOffset, 40, 13, (dcErrCursor == 1));
+    display.setTextWrap(true);
+    return;
+  }
+
+  const int clipTop = 13 + yOffset, clipBot = 49 + yOffset;
+  int contentH = dcTotalRows * AI_LINE_H + (dcSending ? AI_LINE_H : 0);
+  int maxScroll = max(0, contentH - AI_VIEW_H);
+  dcScroll = constrain(dcScroll, 0, maxScroll);
+
+  if (dcMsgCount == 0 && !dcSending) {
+    display.setCursor(2, 23 + yOffset);
+    display.print("No messages yet.");
+  } else {
+    int r0 = dcScroll / AI_LINE_H;
+    if (r0 != dcViewR0 || dcIndexGen != dcViewGen || dcSending != dcViewSending) {
+      dcRebuildView(r0); // the only place that touches flash; runs when the view actually changes
+      dcViewR0 = r0;
+      dcViewGen = dcIndexGen;
+      dcViewSending = dcSending;
+    }
+    for (int i = 0; i < DC_VIEW_ROWS; i++) {
+      int y = AI_VIEW_TOP + yOffset + (r0 + i) * AI_LINE_H - dcScroll;
+      if (dcViewRow[i].length() > 0 && y >= clipTop && y + 7 <= clipBot) {
+        display.setCursor(2, y);
+        display.print(dcViewRow[i]);
+      }
+    }
+  }
+
+  if (maxScroll > 0) {
+    int trackH = AI_VIEW_H;
+    int thumbH = max(4, (trackH * AI_VIEW_H) / contentH);
+    int thumbY = 13 + yOffset + ((trackH - thumbH) * dcScroll) / maxScroll;
+    display.drawFastVLine(126, 13 + yOffset, trackH, SSD1306_WHITE);
+    display.fillRect(125, thumbY, 3, thumbH, SSD1306_WHITE);
+  }
+
+  bool inputSel = (dcFocus == 1);
+  if (inputSel) { display.fillRect(0, 49 + yOffset, 94, 14, SSD1306_WHITE); display.setTextColor(SSD1306_BLACK); }
+  else          { display.drawRect(0, 49 + yOffset, 94, 14, SSD1306_WHITE); display.setTextColor(SSD1306_WHITE); }
+  String shown = dcInputText;
+  if (shown.length() == 0) shown = "Type msg...";
+  if (shown.length() > 15) shown = shown.substring(shown.length() - 15);
+  display.setCursor(3, 53 + yOffset);
+  display.print(shown);
+  display.setTextColor(SSD1306_WHITE);
+  drawBoxedCenteredText(display, "SEND", 96, 49 + yOffset, 32, 14, (dcFocus == 2));
+
+  if (dcFocus == 0) {
+    display.drawRect(0, 12 + yOffset, 128, AI_VIEW_H + 1, SSD1306_WHITE);
+    if (dcScrollMode) display.drawRect(1, 13 + yOffset, 126, AI_VIEW_H - 1, SSD1306_WHITE);
+  }
+
+  if (dcBanner.length() > 0 && millis() - dcBannerAt < 4500) {
+    int starts[8], lens[8];
+    int n = dcWrapRows(dcBanner, starts, lens, 8);
+    int boxH = min(n, 4) * 9 + 5;
+    int boxY = 14 + yOffset;
+    display.fillRect(2, boxY, 124, boxH, SSD1306_BLACK);
+    display.drawRect(2, boxY, 124, boxH, SSD1306_WHITE);
+    for (int k = 0; k < n && k < 4; k++) {
+      drawCenteredText(display, dcBanner.substring(starts[k], starts[k] + lens[k]), boxY + 3 + k * 9, 1);
+    }
+  }
+  display.setTextWrap(true);
+}
+
 /* ---------------------------- WiFi app ---------------------------- */
+
+// Radio settings, applied once the station has started (so: after WiFi.mode(WIFI_STA), again right before
+// each WiFi.begin(), and whenever the power mode changes). TX power asks for the top of the API's range
+// (21 dBm); the PHY clamps that to its own cap (20 dBm on this build). Power Mode additionally pins modem
+// sleep on, so the connection stays up between deep-sleep-free idle periods without keeping the radio awake.
+void wifiApplyRadioSettings() {
+  WiFi.setTxPower(WIFI_POWER_21dBm);
+  if (powerMode == PM_POWER) WiFi.setSleep(WIFI_PS_MIN_MODEM);
+}
 // Ported from AIO_Transmitter's WiFi UI: same screen flow, keyboard grid, and
 // focus-nav logic. Trimmed down to what was actually asked for here -- no
 // boot-time auto-connect, no "Auto On" toggle, no connectivity pinger/forbidden-
@@ -1501,7 +2737,8 @@ void drawWifiKeyboard() {
 
   if (kbInputBuffer.length() == 0) {
     display.setTextColor(0x5555);
-    if (kbReturnScreen == SCREEN_AI_CHAT) display.print("Type message...");
+    if (kbReturnScreen == SCREEN_AI_CHAT || kbReturnScreen == SCREEN_DISCORD_CHAT) display.print("Type message...");
+    else if (kbReturnScreen == SCREEN_DISCORD_ADD) display.print(dcEditField == 0 ? "Name (max 11)..." : "User ID (digits)...");
     else display.print("Type password...");
     display.setTextColor(SSD1306_WHITE);
   } else {
@@ -1700,7 +2937,7 @@ void startNtpSync() {
     ntpSlotDone[i] = false;
     ntpSlotOk[i] = false;
     ntpSlotEpoch[i] = 0;
-    xTaskCreate(ntpQueryTask, "NtpQ", 4096, (void*)(intptr_t)i, 1, NULL);
+    xTaskCreate(ntpQueryTask, "NtpQ", 4096, (void*)(intptr_t)i, PRIO_BACKGROUND, NULL);
   }
 }
 
@@ -1847,7 +3084,7 @@ void aiStartTask() {
   aiTaskStarted = true;
   // TLS handshake is stack-hungry -- 4096 (what the pinger uses for plain
   // HTTP) overflows here.
-  xTaskCreate(aiChatTask, "AiChat", 12288, NULL, 1, NULL);
+  xTaskCreate(aiChatTask, "AiChat", 12288, NULL, PRIO_BACKGROUND, NULL);
 }
 
 void aiSendMessage() {
@@ -2022,7 +3259,7 @@ void connectivityTask(void *p) {
 void startConnectivityPinger() {
   if (pingerStarted) return;
   pingerStarted = true;
-  xTaskCreate(connectivityTask, "NetPing", 4096, NULL, 1, NULL);
+  xTaskCreate(connectivityTask, "NetPing", 4096, NULL, PRIO_BACKGROUND, NULL);
 }
 
 void drawWifiStatusIcon(int x, int y) {
@@ -2043,6 +3280,7 @@ void enterDeepSleep() {
   // never survives deep sleep anyway (the whole chip powers down) -- force it
   // off cleanly rather than leaving the radio in an undefined state. It stays
   // off on wake too; nothing here re-enables it automatically.
+  dcGatewayShutdown(); // leave Discord properly (close frame) while WiFi is still up
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
 
@@ -2055,6 +3293,15 @@ void enterDeepSleep() {
 void setup() {
   Serial.begin(115200);
   delay(100);
+
+  // Power mode first: Eco needs the CPU slowed down before the I2C bus is configured, and a flat battery
+  // has to be caught before anything else spends power.
+  powerLoad();
+  powerBootV = powerReadBootVoltage();
+  powerBootDecide(powerBootV);
+  Serial.printf("[PWR] boot mode=%u prev=%u crit=%d armed=%d bootV=%.2f\n",
+                (unsigned)powerMode, (unsigned)powerPrev, (int)powerCrit, (int)powerLowArmed, powerBootV);
+  if (powerMode == PM_ECO) setCpuFrequencyMhz(40);
 
   // Restwise is deliberately a no-radio device -- kill both radios outright
   // rather than merely leaving them unused, so the chip never transmits.
@@ -2075,7 +3322,7 @@ void setup() {
 
   setupButtons();
 
-  xTaskCreate(batteryAdcTask, "BatteryADC", 2048, NULL, 1, NULL);
+  if (powerMode != PM_ECO) xTaskCreate(batteryAdcTask, "BatteryADC", 2048, NULL, PRIO_BACKGROUND, NULL); // Eco is awake only 5 s
 
   Wire.begin(PIN_SDA, PIN_SCL);
   Wire.setClock(I2C_CLOCK_DISPLAY); // 1MHz -- gives ~2.6x headroom over the 40 FPS OLED requirement
@@ -2120,9 +3367,23 @@ void setup() {
   buildMenu();
 
   lastActivityTime = millis();
+
+  if (powerMode == PM_ECO) {
+    // The battery task isn't started in Eco, so hand the watch face the voltage measured at boot --
+    // otherwise its battery indicator would read empty.
+    batteryVoltage = powerBootV;
+    batteryReadingValid = powerBootV > POWER_MIN_VALID_V;
+    bool critical = powerBootV > POWER_MIN_VALID_V && powerBootV < POWER_CRIT_V;
+    currentScreen = critical ? SCREEN_ECO_CRITICAL : SCREEN_ECO_CLOCK;
+  }
 }
 
+uint32_t dbgFrames = 0; // frames drawn since the last health line
+
 void loop() {
+  static unsigned long dbgIterPrev = 0, dbgIterMaxUs = 0, dbgLoops = 0;
+  { unsigned long n = micros(); if (dbgIterPrev && n - dbgIterPrev > dbgIterMaxUs) dbgIterMaxUs = n - dbgIterPrev; dbgIterPrev = n; dbgLoops++; }
+
   readButtons();
 
   // Presses stay latched while the display is off (so the wake press can be swallowed below) and
@@ -2155,6 +3416,9 @@ void loop() {
     }
   }
 
+  ecoTick();
+  powerBatteryWatch();
+
   // Serial ownership: the Terminal app has its own protocol, so it reads Serial
   // while active. EVERY other screen hands Serial to the Restwise sync listener.
   // This matters because opening the USB port from a PC resets the chip -- it
@@ -2171,11 +3435,11 @@ void loop() {
   // exception is animations -- blanking mid-slide would strand the transition
   // halfway. This gives the Lock Screen timeout its intended global effect.
   bool dinoRunning = (currentScreen == SCREEN_DINO && dinoState == DINO_PLAYING);
-  bool allowBlank = !isAnimating && currentScreen != SCREEN_ANIMATOR && !dinoRunning &&
+  bool allowBlank = powerMode != PM_ECO && !isAnimating && currentScreen != SCREEN_ANIMATOR && !dinoRunning &&
                      currentScreen != SCREEN_WIFI_SCANNING &&
                      currentScreen != SCREEN_WIFI_PASSWORD &&
                      currentScreen != SCREEN_WIFI_NTP &&
-                     !aiBusy;
+                     !aiBusy && !dcBusy;
 
   if (displayOn && allowBlank) {
     if (millis() - lastActivityTime > DISPLAY_TIMEOUT_MS) {
@@ -2197,13 +3461,14 @@ void loop() {
   // WiFi scan/password-entry/connect/NTP-sync in flight, or a pending AI
   // reply. Otherwise WiFi is free to keep running through an ordinary
   // display-off idle blank -- only deep sleep forces it off.
-  bool allowDeepSleep = !isAnimating && currentScreen != SCREEN_ANIMATOR && !dinoRunning &&
+  // Balanced sleeps after 90 s idle; Power never does; Eco has its own 5 s timer (ecoTick).
+  bool allowDeepSleep = powerMode == PM_BALANCED && !isAnimating && currentScreen != SCREEN_ANIMATOR && !dinoRunning &&
                         !swRunning && tmMode != TM_RUNNING &&
                         rwSyncState != RWS_RECV &&
                         currentScreen != SCREEN_WIFI_SCANNING &&
                         currentScreen != SCREEN_WIFI_PASSWORD &&
                         currentScreen != SCREEN_WIFI_NTP &&
-                        !aiBusy;
+                        !aiBusy && !dcBusy;
   if (allowDeepSleep && millis() - lastActivityTime > DEEP_SLEEP_TIMEOUT_MS) {
     enterDeepSleep();
   }
@@ -2280,6 +3545,9 @@ void loop() {
           } else if (app == APP_BATTERY) {
             battCursor = -1;
             startAnimation(SCREEN_BATTERY, -64);
+          } else if (app == APP_POWER) {
+            powerMenuCursor = 0;
+            startAnimation(SCREEN_POWER_MENU, -64);
           } else if (app == APP_WIFI) {
             if (WiFi.status() == WL_CONNECTED) {
               wifiHomeCursor = 0;
@@ -2304,6 +3572,15 @@ void loop() {
               startAnimation(SCREEN_AI_CHAT, -64);
             } else {
               startAnimation(SCREEN_AI_NOWIFI, -64);
+            }
+          } else if (app == APP_DISCORD) {
+            if (WiFi.status() == WL_CONNECTED && internetOK) {
+              dcGatewayRequest();
+              dcLoadContacts();
+              dcCursor = 0;
+              startAnimation(SCREEN_DISCORD_LIST, -64);
+            } else {
+              startAnimation(SCREEN_DISCORD_NOWIFI, -64);
             }
           } else if (app == APP_DINO) {
             dinoOpen();
@@ -2363,6 +3640,85 @@ void loop() {
       else if (currentScreen == SCREEN_DINO) {
         dinoHandleButtons();
       }
+      else if (currentScreen == SCREEN_POWER_MENU) {
+        if (buttonJustPressed[0]) { if (powerMenuCursor > -1) powerMenuCursor--; }
+        if (buttonJustPressed[1]) { if (powerMenuCursor < 2) powerMenuCursor++; }
+        if (buttonJustPressed[4]) {
+          if (powerMenuCursor == -1) {
+            startAnimation(SCREEN_MENU, 64);
+          } else {
+            powerPending = POWER_TILE_MODE[powerMenuCursor];
+            powerConfirmCursor = 1; // default to NO
+            startAnimation(SCREEN_POWER_CONFIRM, -64);
+          }
+        }
+      }
+      else if (currentScreen == SCREEN_POWER_CONFIRM) {
+        if (buttonJustPressed[2]) powerConfirmCursor = 0;
+        if (buttonJustPressed[3]) powerConfirmCursor = 1;
+        if (buttonJustPressed[4]) {
+          if (powerConfirmCursor == 0) powerSelect(powerPending); // Eco restarts the chip and never returns here
+          startAnimation(SCREEN_POWER_MENU, 64);
+        }
+      }
+      else if (currentScreen == SCREEN_ECO_CLOCK || currentScreen == SCREEN_ECO_EXIT) {
+        ecoHandleButtons();
+      }
+      else if (currentScreen == SCREEN_DISCORD_NOWIFI) {
+        if (buttonJustPressed[2] || buttonJustPressed[4]) startAnimation(SCREEN_MENU, 64);
+      }
+      else if (currentScreen == SCREEN_DISCORD_LIST) {
+        if (buttonJustPressed[0]) { if (dcCursor > -1) dcCursor--; }
+        if (buttonJustPressed[1]) { if (dcCursor < dcContactCount) dcCursor++; }
+        if (buttonJustPressed[3] && dcCursor >= 1) {
+          dcDeleteIdx = dcCursor - 1;
+          dcDeleteCursor = 1;
+          startAnimation(SCREEN_DISCORD_DELETE, -64);
+        }
+        if (buttonJustPressed[4]) {
+          if (dcCursor == -1) {
+            startAnimation(SCREEN_MENU, 64);
+          } else if (dcCursor == 0) {
+            dcNewName = ""; dcNewId = ""; dcFormError = "";
+            dcFormCursor = 0;
+            startAnimation(SCREEN_DISCORD_ADD, -64);
+          }
+          else dcOpenChat(dcCursor - 1);
+        }
+      }
+      else if (currentScreen == SCREEN_DISCORD_CHAT) {
+        dcHandleButtons();
+      }
+      else if (currentScreen == SCREEN_DISCORD_ADD) {
+        if (buttonJustPressed[0]) { if (dcFormCursor > -1) dcFormCursor--; }
+        if (buttonJustPressed[1]) { if (dcFormCursor < 2) dcFormCursor++; }
+        if (buttonJustPressed[4]) {
+          if (dcFormCursor == -1) {
+            startAnimation(SCREEN_DISCORD_LIST, 64);
+          } else if (dcFormCursor <= 1) {
+            dcOpenKeyboard(dcFormCursor);
+          } else {
+            dcFormError = dcAddContact(dcNewName, dcNewId);
+            if (dcFormError.length() > 0) {
+              dcFormErrorAt = millis();
+            } else {
+              dcCursor = dcContactCount; // land on the new tile
+              startAnimation(SCREEN_DISCORD_LIST, 64);
+            }
+          }
+        }
+      }
+      else if (currentScreen == SCREEN_DISCORD_DELETE) {
+        if (buttonJustPressed[2]) dcDeleteCursor = 0;
+        if (buttonJustPressed[3]) dcDeleteCursor = 1;
+        if (buttonJustPressed[4]) {
+          if (dcDeleteCursor == 0) {
+            dcDeleteContact(dcDeleteIdx);
+            if (dcCursor > dcContactCount) dcCursor = dcContactCount;
+          }
+          startAnimation(SCREEN_DISCORD_LIST, 64);
+        }
+      }
       else if (currentScreen == SCREEN_WIFI_CONFIRM) {
         if (buttonJustPressed[0]) wifiConfirmCursor = -1;
         if (buttonJustPressed[1] && wifiConfirmCursor == -1) wifiConfirmCursor = 0;
@@ -2373,6 +3729,7 @@ void loop() {
             if (WIFI_APP_ENABLED) {
               wifiEnabled = true; wifiStatusMsg = ""; wifiRetryCount = 0;
               WiFi.mode(WIFI_STA); WiFi.scanDelete();
+              wifiApplyRadioSettings();
               WiFi.disconnect(); delay(100);
               WiFi.scanNetworks(true);
               wifiScanStart = millis(); wifiScanResults = -1;
@@ -2410,13 +3767,16 @@ void loop() {
         if (buttonJustPressed[4]) {
           if (wifiPasswordCursor == -1) { WiFi.disconnect(); startAnimation(SCREEN_WIFI_RESULTS, 64); }
           else if (wifiPasswordCursor == 0) {
-            kbInputBuffer = wifiPassword; currentKBMode = KB_LOWER;
+            kbInputBuffer = wifiPassword;
+            kbShiftOnce = (kbInputBuffer.length() == 0); // only an empty field starts capitalised, never an autofilled password
+            currentKBMode = kbShiftOnce ? KB_UPPER : KB_LOWER;
             kbCursorRow = 0; kbCursorCol = 0;
             kbTextCursor   = kbInputBuffer.length();
             kbScrollOffset = 0;
             kbReturnScreen = SCREEN_WIFI_PASSWORD;
             currentScreen  = SCREEN_WIFI_KEYBOARD;
           } else if (wifiPasswordCursor == 1) {
+            wifiApplyRadioSettings();
             WiFi.begin(wifiTargetSSID.c_str(), wifiPassword.c_str());
             wifiConnecting = true;
             wifiConnectStartTime = millis();
@@ -2462,6 +3822,13 @@ void loop() {
             if (kbReturnScreen == SCREEN_AI_CHAT) {
               aiInputText = kbInputBuffer;
               aiFocus = (aiInputText.length() > 0) ? 2 : 1;
+            } else if (kbReturnScreen == SCREEN_DISCORD_CHAT) {
+              dcInputText = kbInputBuffer;
+              dcFocus = (dcInputText.length() > 0) ? 2 : 1;
+            } else if (kbReturnScreen == SCREEN_DISCORD_ADD) {
+              if (dcEditField == 0) dcNewName = kbInputBuffer;
+              else dcNewId = kbInputBuffer;
+              dcFormCursor = (dcEditField == 0) ? 1 : 2; // move on to the next field / SAVE
             } else {
               wifiPassword = kbInputBuffer;
             }
@@ -2480,12 +3847,30 @@ void loop() {
               kbTextCursor--;
             }
           } else if (strcmp(key, "^") == 0) {
-            if (currentKBMode == KB_LOWER) currentKBMode = KB_UPPER;
-            else if (currentKBMode == KB_UPPER) currentKBMode = KB_SYMBOL;
-            else currentKBMode = KB_LOWER;
+            if (kbShiftOnce && currentKBMode == KB_UPPER) {
+              currentKBMode = KB_LOWER; // ^ on the automatic first capital means "no, lowercase"
+            } else {
+              if (currentKBMode == KB_LOWER) currentKBMode = KB_UPPER;
+              else if (currentKBMode == KB_UPPER) currentKBMode = KB_SYMBOL;
+              else currentKBMode = KB_LOWER;
+            }
+            kbShiftOnce = false;
           } else {
-            kbInputBuffer = kbInputBuffer.substring(0, kbTextCursor) + String(key) + kbInputBuffer.substring(kbTextCursor);
-            kbTextCursor += String(key).length();
+            bool allow = true;
+            if (kbReturnScreen == SCREEN_DISCORD_CHAT) {
+              allow = (int)kbInputBuffer.length() < DC_SEND_MAX;
+            } else if (kbReturnScreen == SCREEN_DISCORD_ADD) {
+              if (dcEditField == 0) allow = ((int)kbInputBuffer.length() < DC_NAME_MAX) && key[0] != '|' && key[0] != '\\';
+              else allow = ((int)kbInputBuffer.length() < DC_ID_MAX) && key[0] >= '0' && key[0] <= '9';
+            }
+            if (allow) {
+              kbInputBuffer = kbInputBuffer.substring(0, kbTextCursor) + String(key) + kbInputBuffer.substring(kbTextCursor);
+              kbTextCursor += String(key).length();
+              if (kbShiftOnce) { // the automatic first capital is used up
+                if (currentKBMode == KB_UPPER) currentKBMode = KB_LOWER;
+                kbShiftOnce = false;
+              }
+            }
           }
         }
       }
@@ -2562,6 +3947,7 @@ void loop() {
               kbTextCursor   = kbInputBuffer.length();
               kbScrollOffset = 0;
               currentKBMode  = KB_LOWER;
+              kbShiftOnce = false;
               kbCursorRow = 0; kbCursorCol = 0;
               kbReturnScreen = SCREEN_AI_CHAT;
               currentScreen  = SCREEN_WIFI_KEYBOARD;
@@ -3001,12 +4387,18 @@ void loop() {
     // plays at the same speed, just choppier.
     uint32_t frameUs = 1000000UL / 60;
     if (currentScreen == SCREEN_ANIMATOR && !isAnimating) frameUs = 1000000UL / animatorFps;
+    if (powerMode == PM_ECO) frameUs = 1000000UL / 5; // Eco: 5 FPS
     uint32_t nowUs = micros();
     int32_t lateUs = (int32_t)(nowUs - nextFrameUs);
+    // nextFrameUs only advances while the display is on, and micros() wraps every ~71.6 minutes. After a
+    // long blank the deadline can look like it is far in the *future* (negative lateUs), which would
+    // suppress every frame for up to ~36 minutes. A real deadline is never more than one period ahead.
+    if (lateUs < -1000000) { nextFrameUs = nowUs; lateUs = 0; }
     if (lateUs >= 0) {
       if (lateUs > (int32_t)(2 * frameUs)) nextFrameUs = nowUs; // long stall: resync instead of bursting frames
       nextFrameUs += frameUs;
       updateDisplay();
+      dbgFrames++;
     }
   }
 
@@ -3047,6 +4439,12 @@ void loop() {
     lastActivityTime = millis(); // a reply counts as activity, don't sleep on it
   }
 
+  // Bring the Discord gateway up the moment WiFi and internet are both there, wherever you are on the
+  // watch. Status then follows where you are: green inside the Discord app, idle (yellow moon) outside.
+  if (WIFI_APP_ENABLED && !dcGwWanted && WiFi.status() == WL_CONNECTED && internetOK) dcGatewayRequest();
+
+  dcUpdate();
+
   // ---- NTP sync polling -- non-blocking. The 4 query tasks run independently
   // in the background; this just checks in on them each loop tick. Waits for
   // either all 4 to finish or the 20s budget to expire, then picks the
@@ -3082,6 +4480,24 @@ void loop() {
       }
     } else if (millis() - wifiNtpDoneAt > NTP_RESULT_HOLD_MS) {
       startAnimation(SCREEN_WIFI_HOME, 64);
+    }
+  }
+
+  // Health line every 2 s (USB serial only): if the watch ever stops responding, the last of these
+  // shows whether the loop was still running and what state the UI/buttons/memory were in.
+  {
+    static unsigned long hbAt = 0;
+    if (millis() - hbAt >= 2000) {
+      hbAt = millis();
+      if (Serial) {
+        Serial.printf("[HB] t=%lus mode=%u v=%.2f scr=%d anim=%d disp=%d wifi=%d gw=%d%d loops=%lu maxIter=%luus frames=%lu heap=%u/%u stack=%u held=%d%d%d%d%d latch=%d%d%d%d%d\n",
+                      millis() / 1000UL, (unsigned)powerMode, batteryVoltage, (int)currentScreen, (int)isAnimating, (int)displayOn,
+                      (int)WiFi.status(), (int)dcGwConnected, (int)dcPresenceSent, dbgLoops, dbgIterMaxUs, (unsigned long)dbgFrames,
+                      (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(), (unsigned)uxTaskGetStackHighWaterMark(NULL),
+                      (int)buttonStates[0], (int)buttonStates[1], (int)buttonStates[2], (int)buttonStates[3], (int)buttonStates[4],
+                      (int)btnLatched[0], (int)btnLatched[1], (int)btnLatched[2], (int)btnLatched[3], (int)btnLatched[4]);
+      }
+      dbgLoops = 0; dbgIterMaxUs = 0; dbgFrames = 0;
     }
   }
 
@@ -3123,7 +4539,7 @@ void setupButtons() {
   for (int i = 0; i < 5; i++) {
     pinMode(buttonPins[i], INPUT_PULLUP);
   }
-  xTaskCreate(buttonTask, "Buttons", 2048, NULL, 2, NULL);
+  xTaskCreate(buttonTask, "Buttons", 2048, NULL, PRIO_BUTTONS, NULL);
 }
 
 void readButtons() {
@@ -3249,6 +4665,16 @@ void drawScreen(ScreenState screen, int yOffset) {
   else if (screen == SCREEN_BATTERY) drawBattery(yOffset);
   else if (screen == SCREEN_BATTERY_INDICATOR) drawBatteryIndicator(yOffset);
   else if (screen == SCREEN_DINO) drawDino(yOffset);
+  else if (screen == SCREEN_DISCORD_NOWIFI) drawDiscordNoWifi(yOffset);
+  else if (screen == SCREEN_DISCORD_LIST) drawDiscordList(yOffset);
+  else if (screen == SCREEN_DISCORD_ADD) drawDiscordAdd(yOffset);
+  else if (screen == SCREEN_DISCORD_DELETE) drawDiscordDelete(yOffset);
+  else if (screen == SCREEN_DISCORD_CHAT) drawDiscordChat(yOffset);
+  else if (screen == SCREEN_POWER_MENU) drawPowerMenu(yOffset);
+  else if (screen == SCREEN_POWER_CONFIRM) drawPowerConfirm(yOffset);
+  else if (screen == SCREEN_ECO_CLOCK) drawWatchFace(yOffset); // Eco shows the ordinary watch face; only the buttons are locked down
+  else if (screen == SCREEN_ECO_EXIT) drawEcoExit(yOffset);
+  else if (screen == SCREEN_ECO_CRITICAL) drawEcoCritical(yOffset);
   else if (screen == SCREEN_WIFI_CONFIRM) drawWifiConfirm(yOffset);
   else if (screen == SCREEN_WIFI_SCANNING) drawWifiScanning(yOffset);
   else if (screen == SCREEN_WIFI_RESULTS) drawWifiResults(yOffset);
@@ -3351,7 +4777,7 @@ void drawMenu(int yOffset) {
     int y = listY + ((i - startIdx) * itemH);
 
     if (i == menuIndex) {
-      display.fillRect(0, y-1, 128, itemH, SSD1306_WHITE);
+      display.fillRect(0, y-1, 123, itemH, SSD1306_WHITE); // stops short of the scroll bar
       display.setTextColor(SSD1306_BLACK);
     } else {
       display.setTextColor(SSD1306_WHITE);
@@ -3360,6 +4786,15 @@ void drawMenu(int yOffset) {
     display.setCursor(4, y);
     display.print(menuAppNames[menuApps[i]]);
   }
+
+  // Scroll bar down the right edge: the thumb's size is the visible share of the list, its position
+  // is where the selection sits.
+  display.setTextColor(SSD1306_WHITE);
+  const int trackY = 14 + yOffset, trackH = 49;
+  display.drawFastVLine(126, trackY, trackH, SSD1306_WHITE);
+  int thumbH = max(5, (trackH * 4) / menuCount);
+  int thumbY = trackY + ((trackH - thumbH) * menuIndex) / max(1, menuCount - 1);
+  display.fillRect(125, thumbY, 3, thumbH, SSD1306_WHITE);
 }
 
 void drawStopwatch(int yOffset) {
