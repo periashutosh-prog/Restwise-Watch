@@ -169,6 +169,12 @@ const uint32_t BTN_PRESS_TTL_MS = 350;    // a latched press older than this is 
 volatile bool btnHeld[5] = {false, false, false, false, false};
 volatile bool btnLatched[5] = {false, false, false, false, false};
 volatile uint32_t btnLatchedAt[5] = {0, 0, 0, 0, 0};
+// Diagnostics: raw level changes the sampler saw (chatter shows up as a huge count), debounced presses
+// it accepted, and presses the UI loop actually took. A press that is accepted but never taken is a
+// software gating problem; edges far above 2 per press means a bouncing / marginal contact.
+volatile uint32_t btnEdges[5] = {0, 0, 0, 0, 0};
+volatile uint32_t btnPresses[5] = {0, 0, 0, 0, 0};
+volatile uint32_t btnTaken[5] = {0, 0, 0, 0, 0};
 
 enum MenuApp {
   APP_RESTWISE, APP_STOPWATCH, APP_TIMER, APP_CALCULATOR, APP_ANIMATOR, APP_BATTERY, APP_POWER,
@@ -1937,13 +1943,22 @@ bool dcIdGreater(const char* a, const char* b) {
 String dcErrorText(int code, const String &resp) {
   JsonDocument d;
   int jc = 0;
-  if (!deserializeJson(d, resp)) jc = d["code"] | 0;
-  if (jc == 50007) return "Watch: You and the user need a common server :)";
+  String msg = "";
+  if (!deserializeJson(d, resp)) {
+    jc = d["code"] | 0;
+    msg = String(d["message"] | "");
+  }
+  // 50007 is the older code for this, 50278 the newer, more specific one ("no mutual guilds").
+  if (jc == 50007 || jc == 50278) return "Watch: You and the user need a common server :)";
   if (code == 401) return "Bad bot token (401)";
   if (jc == 10013 || jc == 10003 || code == 404) return "Unknown user ID";
   if (jc == 50001 || jc == 50013) return "Discord says: no access";
   if (code == 429) return "Rate limited, try again soon";
   if (code <= 0) return "Can't reach Discord. WiFi or clock?";
+  if (msg.length() > 0) { // a code we have no wording for: show Discord's own explanation
+    String s = aiToAscii(String("Discord ") + code + ": " + msg);
+    return s.length() > 80 ? s.substring(0, 80) : s;
+  }
   return String("Discord error ") + code;
 }
 
@@ -1969,6 +1984,7 @@ int dcHttp(const char* method, const String &path, const String &body, String &r
     int code = (method[0] == 'P') ? http.POST(body) : http.GET();
     resp = (code > 0) ? http.getString() : String();
     http.end();
+    if (code >= 400) Serial.printf("[DC] HTTP %d %s -> %.160s\n", code, path.c_str(), resp.c_str());
     if (code != 429) {
       if (code < 0) {
         char err[100];
@@ -3395,6 +3411,21 @@ void loop() {
     if (buttonStates[i] || btnLatched[i]) activityDetected = true;
   }
 
+  // One line per accepted press (USB serial only) so a missed press can be told apart from a press
+  // that never reached the sampler: edges = raw level changes, taken = presses the UI actually used.
+  {
+    static uint32_t seenPresses[5] = {0, 0, 0, 0, 0};
+    static const char *const btnNames[5] = {"UP", "DOWN", "LEFT", "RIGHT", "CENTER"};
+    for (int i = 0; i < 5; i++) {
+      if (btnPresses[i] == seenPresses[i]) continue;
+      seenPresses[i] = btnPresses[i];
+      if (Serial) {
+        Serial.printf("[BTN] %s press #%lu edges=%lu taken=%lu scr=%d anim=%d disp=%d\n", btnNames[i], (unsigned long)btnPresses[i],
+                      (unsigned long)btnEdges[i], (unsigned long)btnTaken[i], (int)currentScreen, (int)isAnimating, (int)displayOn);
+      }
+    }
+  }
+
   if (activityDetected) {
     lastActivityTime = millis();
     if (!displayOn) {
@@ -4490,12 +4521,13 @@ void loop() {
     if (millis() - hbAt >= 2000) {
       hbAt = millis();
       if (Serial) {
-        Serial.printf("[HB] t=%lus mode=%u v=%.2f scr=%d anim=%d disp=%d wifi=%d gw=%d%d loops=%lu maxIter=%luus frames=%lu heap=%u/%u stack=%u held=%d%d%d%d%d latch=%d%d%d%d%d\n",
+        Serial.printf("[HB] t=%lus mode=%u v=%.2f scr=%d anim=%d disp=%d wifi=%d gw=%d%d loops=%lu maxIter=%luus frames=%lu heap=%u/%u stack=%u held=%d%d%d%d%d latch=%d%d%d%d%d edges=%lu/%lu/%lu/%lu/%lu\n",
                       millis() / 1000UL, (unsigned)powerMode, batteryVoltage, (int)currentScreen, (int)isAnimating, (int)displayOn,
                       (int)WiFi.status(), (int)dcGwConnected, (int)dcPresenceSent, dbgLoops, dbgIterMaxUs, (unsigned long)dbgFrames,
                       (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(), (unsigned)uxTaskGetStackHighWaterMark(NULL),
                       (int)buttonStates[0], (int)buttonStates[1], (int)buttonStates[2], (int)buttonStates[3], (int)buttonStates[4],
-                      (int)btnLatched[0], (int)btnLatched[1], (int)btnLatched[2], (int)btnLatched[3], (int)btnLatched[4]);
+                      (int)btnLatched[0], (int)btnLatched[1], (int)btnLatched[2], (int)btnLatched[3], (int)btnLatched[4],
+                      (unsigned long)btnEdges[0], (unsigned long)btnEdges[1], (unsigned long)btnEdges[2], (unsigned long)btnEdges[3], (unsigned long)btnEdges[4]);
       }
       dbgLoops = 0; dbgIterMaxUs = 0; dbgFrames = 0;
     }
@@ -4509,10 +4541,11 @@ void loop() {
 // Priority 2 (above loopTask's 1) so sampling stays on time even while loop() is busy redrawing
 // (~26ms per frame) or other tasks are crunching TLS/NTP.
 void buttonTask(void *pv) {
-  bool state[5];
+  bool state[5], lastRaw[5];
   uint8_t diffCount[5] = {0, 0, 0, 0, 0};
   for (int i = 0; i < 5; i++) {
     state[i] = !digitalRead(buttonPins[i]);
+    lastRaw[i] = state[i];
     btnHeld[i] = state[i]; // start from the real level so a button still held at boot isn't a phantom press
   }
 
@@ -4521,6 +4554,7 @@ void buttonTask(void *pv) {
     vTaskDelayUntil(&last, pdMS_TO_TICKS(BTN_SAMPLE_MS));
     for (int i = 0; i < 5; i++) {
       bool raw = !digitalRead(buttonPins[i]);
+      if (raw != lastRaw[i]) { lastRaw[i] = raw; btnEdges[i]++; }
       if (raw == state[i]) { diffCount[i] = 0; continue; }
       if (++diffCount[i] >= BTN_STABLE_SAMPLES) {
         diffCount[i] = 0;
@@ -4529,6 +4563,7 @@ void buttonTask(void *pv) {
         if (raw) {
           btnLatchedAt[i] = millis();
           btnLatched[i] = true;
+          btnPresses[i]++;
         }
       }
     }
@@ -4550,7 +4585,9 @@ bool takeButtonPress(int i) {
   if (!btnLatched[i]) return false;
   uint32_t at = btnLatchedAt[i];
   btnLatched[i] = false;
-  return (millis() - at) <= BTN_PRESS_TTL_MS;
+  bool fresh = (millis() - at) <= BTN_PRESS_TTL_MS;
+  if (fresh) btnTaken[i]++;
+  return fresh;
 }
 
 DateTime nowTime() {
