@@ -7,3 +7,8 @@ discord_config.h
 # Arduino build artifacts
 build/
 *.bin
+
+# PC test (host-test/): the compiled program and the font copy are made by compare_with_python.py
+host-test/*.exe
+host-test/*.pdb
+host-test/glcdfont_copy.c

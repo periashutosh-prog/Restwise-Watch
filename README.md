@@ -83,9 +83,20 @@ A small, line-based ASCII protocol runs over the same USB serial connection used
 Host -> ESP   RW_HELLO                          ESP -> Host   RW_HELLO
 Host -> ESP   RW_TIME <YYYY-MM-DD HH:MM:SS>      ESP -> Host   RW_TIME_OK
 Host -> ESP   RW_BEGIN                           ESP -> Host   RW_READY
-Host -> ESP   <days>|<startMin>|<endMin>|<label>  (repeated, one per line)
+Host -> ESP   C|<key>|<Name>                     (8 lines: the category names, e.g. C|school|School, C|free|Free time)
+Host -> ESP   <days>:<category>|<startMin>|<endMin>|<label>  (repeated, one per line)
 Host -> ESP   RW_END                             ESP -> Host   RW_OK <count>
 ```
+
+`<label>` is the block's name as typed on the website (up to 19 characters, may be empty) and `<category>` is the key chosen in the website's dropdown: `school`, `tuition`, `homework`, `meal`, `break`, `sleep`, `free` or `travel`. The category is written after a colon in the first field so firmware that predates it still reads the day mask and ignores the rest; `C|` lines are skipped by older firmware as well. A block synced without a category (an older timetable) falls back to guessing its icon from the words in its name.
+
+### The current-block screen
+
+On waking from deep sleep (and from idle screen-off) the watch checks the timetable first: if a block is running it shows that block, otherwise the watchface. The screen has an icon on the left chosen by the block's category (book = school, tuition and homework; bowl = meal; moon = sleep; clock = free time; car = travel; bottle = break) and, on the right, the start-end time and the block's name. Only a night Sleep block says "Good Night!". The layout lives in `block_screen.h` and the icons in `block_icons.h` (generated from `UI-Screens/render_engine/block_ui.py`); `host-test/` runs the same code on a PC and checks it pixel-for-pixel against the approved renders.
+
+### Two builds
+
+`build_config.h` has a switch, `RESTWISE_NO_RADIO`. `python tools/build_variants.py both` compiles the full build (WiFi app, Discord, AI Chatbot, NTP) and the **no-radio build**, where none of that code is compiled in, from the same source.
 
 Receiving a handshake auto-navigates the watch to the Restwise screen, since opening the serial port resets the chip back to the watchface. The received schedule is written straight to `/timetable.rw` on LittleFS and reloaded immediately once the transfer completes -- no reboot required.
 
@@ -96,6 +107,11 @@ Receiving a handshake auto-navigates the watch to the Restwise screen, since ope
 ```
 Restwise-watch/
 ├── Restwise-watch.ino    # Firmware source (this repo's main sketch)
+├── block_screen.h        # Current-block screen, block lookup and name layout (shared with host-test/)
+├── block_icons.h         # The six 40x40 block icons (generated)
+├── build_config.h        # RESTWISE_NO_RADIO switch
+├── tools/                # build_variants.py: compile the full and the no-radio build
+├── host-test/            # Runs block_screen.h on a PC and compares it with the approved renders
 ├── PCB Files/            # Schematic, PCB layout, and Gerber/export files
 ├── README.md             # This file
 └── LICENSE                # All Rights Reserved

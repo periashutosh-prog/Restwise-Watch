@@ -40,23 +40,28 @@
 //   case deep-sleep wake-on-button-press is added later. Light sleep (see
 //   note above) has no such restriction and works on all five button pins.
 // ---------------------------------------------------------------------------
+#include "build_config.h"   // RESTWISE_NO_RADIO switch (see tools/build_variants.py)
 #include <Arduino.h>
 #include <Wire.h>
 #include <EEPROM.h>
 #include <LittleFS.h>
-#include <WiFi.h>
-#include <WiFiUdp.h>
 #include <RTClib.h>
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_GFX.h>
 #include "esp_sleep.h"
 #include <Preferences.h>
-#include <HTTPClient.h>
-#include <WiFiClientSecure.h>
-#include <ArduinoJson.h>
-#include <WebSocketsClient.h>
+#ifndef RESTWISE_NO_RADIO
+  #include <WiFi.h>
+  #include <WiFiUdp.h>
+  #include <HTTPClient.h>
+  #include <WiFiClientSecure.h>
+  #include <ArduinoJson.h>
+  #include <WebSocketsClient.h>
+#endif
 #include "time.h"
+#include "block_screen.h"   // the current-block screen and the block lookup (also run on the PC by host-test/)
 
+#ifndef RESTWISE_NO_RADIO
 // Groq API key + model, kept out of the repo (ai_config.h is gitignored).
 #if __has_include("ai_config.h")
   #include "ai_config.h"
@@ -71,17 +76,32 @@
   #error "Missing discord_config.h - copy discord_config.example.h to discord_config.h and add your bot token."
 #endif
 #include "discord_roots.h"
+#endif  // RESTWISE_NO_RADIO
 
 // Master switch for the "extras" that exist on the dev watch but should not
 // ship: the WiFi app (false hard-blocks the radio from ever being enabled,
 // even if the UI is reachable) and the Dino Game (false hides it from the
 // Apps menu). Does NOT affect the boot-time WiFi.mode(WIFI_OFF)/btStop()
 // below -- the watch is always radio-off at boot regardless.
+#ifdef RESTWISE_NO_RADIO
+const bool WIFI_APP_ENABLED = false;   // the no-radio build has no WiFi code at all
+#else
 const bool WIFI_APP_ENABLED = true;
 
 // Name the watch shows up as on the router. Hostnames may only contain letters, digits and hyphens,
 // so no apostrophe.
 const char* const WIFI_HOSTNAME = "Ashutosh-Smartwatch";
+#endif
+
+// Used by the idle-blank / deep-sleep checks in loop(): is a radio feature in the middle of something?
+#ifdef RESTWISE_NO_RADIO
+  #define RW_RADIO_BUSY() (false)
+  #define RW_HB_RADIO_FIELDS 0, 0, 0
+#else
+  #define RW_RADIO_BUSY() (currentScreen == SCREEN_WIFI_SCANNING || currentScreen == SCREEN_WIFI_PASSWORD || \
+                           currentScreen == SCREEN_WIFI_NTP || aiBusy || dcBusy)
+  #define RW_HB_RADIO_FIELDS (int)WiFi.status(), (int)dcGwConnected, (int)dcPresenceSent
+#endif
 
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
@@ -142,7 +162,7 @@ enum ScreenState {
   SCREEN_CALCULATOR, SCREEN_CALCULATOR_SCI,
   SCREEN_PIN_ENTRY, SCREEN_SECURITY_MENU, SCREEN_SECURITY_CONFIRM,
   SCREEN_LOCK_SETTINGS, SCREEN_TERMINAL,
-  SCREEN_RESTWISE, SCREEN_RESTWISE_DAY, SCREEN_GOODNIGHT,
+  SCREEN_RESTWISE, SCREEN_RESTWISE_DAY, SCREEN_BLOCK,
   SCREEN_ANIMATOR, SCREEN_BATTERY, SCREEN_BATTERY_INDICATOR, SCREEN_DINO,
   SCREEN_WIFI_CONFIRM, SCREEN_WIFI_SCANNING, SCREEN_WIFI_RESULTS,
   SCREEN_WIFI_PASSWORD, SCREEN_WIFI_KEYBOARD, SCREEN_WIFI_HOME,
@@ -190,6 +210,9 @@ void buildMenu() {
   menuCount = 0;
   for (int a = 0; a < NUM_MENU_APPS; a++) {
     if ((a == APP_DINO || a == APP_DISCORD) && !WIFI_APP_ENABLED) continue;
+#ifdef RESTWISE_NO_RADIO
+    if (a == APP_WIFI || a == APP_AI) continue;
+#endif
     menuApps[menuCount++] = a;
   }
 }
@@ -206,6 +229,9 @@ int animatorSceneIndex = 0;
 unsigned long animatorSceneStart = 0;
 int animatorFps = 60; // user-selectable 10..60 in steps of 10
 
+Preferences prefs;   // settings store: the power mode, the WiFi credentials (full build only) ...
+
+#ifndef RESTWISE_NO_RADIO
 // ---- WiFi app (ported from AIO_Transmitter's WiFi UI/keyboard/focus-nav) ----
 // wifiEnabled reflects the user's explicit on/off choice for this session --
 // never set true automatically. There is no boot-time auto-connect by design.
@@ -227,7 +253,6 @@ String wifiForgetTargetSSID = "";
 int wifiPasswordCursor = 1;
 int wifiRetryCount     = 0;
 
-Preferences prefs;
 const int MAX_SAVED_NETS = 5;
 String savedSSIDs[MAX_SAVED_NETS];
 String savedPWDs[MAX_SAVED_NETS];
@@ -336,6 +361,7 @@ String aiPendingBody;
 String aiReplyText;
 bool   aiTaskStarted = false;
 
+#endif  // RESTWISE_NO_RADIO
 enum TimerMode { TM_SETTING, TM_READY, TM_RUNNING, TM_RINGING };
 TimerMode tmMode = TM_SETTING;
 int tmHours = 0, tmMinutes = 0, tmSeconds = 0;
@@ -460,23 +486,37 @@ const unsigned long TERM_PING_STALE_MS = 4000;
 
 // --- Restwise (timetable app) --------------------------------------------
 // The synced timetable is stored in LittleFS at /timetable.rw, one block per
-// line: "<daysBitmask>|<startMin>|<endMin>|<label>". daysBitmask bit0=Mon .. bit6=Sun.
+// line: "<daysBitmask>[:<category>]|<startMin>|<endMin>|<label>". daysBitmask bit0=Mon .. bit6=Sun.
 // startMin/endMin are minutes since midnight. Water breaks are just ordinary
 // blocks in this list (the website already splits them in before syncing).
-#define RW_MAX_BLOCKS   180
-#define RW_DAY_MAX       96   // max blocks shown for a single day
+// <category> is the website's dropdown key (school, tuition, homework, meal, break, sleep, free, travel); it is
+// written after a colon so a watch running older firmware still reads the number and ignores the rest.
+// The file also holds "C|<key>|<Name>" lines: the category names, synced from the website.
+#define RW_MAX_BLOCKS  2000   // 2000 x 28 bytes = 56 KB of RAM; the file on LittleFS needs about 30 bytes a block. Keep in step with WATCH_MAX_BLOCKS in static/js/home.js
+#define RW_DAY_MAX      200   // max blocks shown for a single day
 #define RW_DAY_ROWS       4   // visible timetable rows in the day view
 #define RW_FILE "/timetable.rw"
 
-struct RwBlock {
-  uint8_t  days;       // bit0=Mon ... bit6=Sun
-  uint16_t startMin;
-  uint16_t endMin;
-  char     label[20];
-};
+typedef rwblk::Block RwBlock;   // days, startMin, endMin, label[20] (the name) and cat (the category), see block_screen.h
 RwBlock rwBlocks[RW_MAX_BLOCKS];
+int  rwDayIdx[RW_DAY_MAX];   // scratch list of one day's blocks (static, not on the stack: the loop task's stack is small)
 int  rwBlockCount = 0;
 bool rwHasData = false;
+
+// Category names as synced from the website ("C|school|School" ...); the built-in names until the first sync.
+char rwCatNames[rwblk::C_COUNT][rwblk::CAT_NAME_LEN];
+void rwResetCatNames() {
+  for (int i = 0; i < rwblk::C_COUNT; i++) {
+    strncpy(rwCatNames[i], rwblk::CAT_DEFAULT_NAMES[i], rwblk::CAT_NAME_LEN - 1);
+    rwCatNames[i][rwblk::CAT_NAME_LEN - 1] = '\0';
+  }
+}
+
+// Which block is running now, looked up at most once a second (the screen redraws many times a second).
+int  rwCachedBlock = -1;
+bool rwCachedNight = false;       // night hours with no block running
+unsigned long rwCachedAt = 0;
+bool rwCacheDirty = true;         // set whenever the timetable or the clock changes
 
 int  rwCursor = -1;          // -1 = back arrow, 0 = Today, 1..6 = Mon..Sat
 int  rwSelectedDayItem = 0;  // which day-list item the day view is showing
@@ -527,7 +567,8 @@ DateTime nowTime();
 void setDeviceTime(const DateTime &dt);
 void drawRestwise(int yOffset);
 void drawRestwiseDay(int yOffset);
-void drawGoodNight(int yOffset);
+void drawBlockScreen(int yOffset);
+ScreenState rwWakeScreen();
 void drawAnimator(int yOffset);
 void processRestwiseSerial();
 void rwLoadFromFile();
@@ -935,7 +976,9 @@ void powerSelect(uint8_t m) {
   if (m == PM_ECO) { powerRestartInto(PM_ECO, false, false); return; }
   powerMode = m;
   powerSave();
+#ifndef RESTWISE_NO_RADIO
   if (WiFi.getMode() != WIFI_OFF) wifiApplyRadioSettings();
+#endif  // RESTWISE_NO_RADIO
 }
 
 // Once a second while awake in Balanced/Power: step down to Eco on a low cell. Needs sustained readings,
@@ -1606,6 +1649,7 @@ void drawDino(int yOffset) {
   }
 }
 
+#ifndef RESTWISE_NO_RADIO
 /* ---------------------------- Terminal Discord ---------------------------- */
 const int DC_MAX_CONTACTS = 20;
 const int DC_NAME_MAX = 11;                // names must be under 12 characters
@@ -3286,6 +3330,7 @@ void drawTowerStatusIcon(int x, int y) {
   display.drawBitmap(x, y, tower_bmp, 8, 8, SSD1306_WHITE);
 }
 
+#endif  // RESTWISE_NO_RADIO
 void enterDeepSleep() {
   if (displayOn) {
     display.ssd1306_command(SSD1306_DISPLAYOFF);
@@ -3296,9 +3341,11 @@ void enterDeepSleep() {
   // never survives deep sleep anyway (the whole chip powers down) -- force it
   // off cleanly rather than leaving the radio in an undefined state. It stays
   // off on wake too; nothing here re-enables it automatically.
+#ifndef RESTWISE_NO_RADIO
   dcGatewayShutdown(); // leave Discord properly (close frame) while WiFi is still up
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
+#endif  // RESTWISE_NO_RADIO
 
   // CENTER is active-low (pressed = LOW), and it's the only button in the
   // LP domain -- see the DEEP_SLEEP_TIMEOUT_MS comment for why.
@@ -3323,9 +3370,11 @@ void setup() {
   // rather than merely leaving them unused, so the chip never transmits.
   // (The ESP32-C6 has BLE in addition to WiFi, unlike the ESP8266, so both
   // get stopped explicitly here.)
+#ifndef RESTWISE_NO_RADIO
   WiFi.setHostname(WIFI_HOSTNAME); // only stores the name; applied whenever the STA interface starts, so this precedes every WiFi.begin()
   WiFi.mode(WIFI_OFF);
   btStop();
+#endif  // RESTWISE_NO_RADIO
 
   EEPROM.begin(EEPROM_SIZE);
 
@@ -3378,7 +3427,9 @@ void setup() {
 
   loadSettings();
   rwLoadFromFile();
+#ifndef RESTWISE_NO_RADIO
   loadCredentials(); // saved WiFi SSID/password pairs -- WiFi itself stays off until asked
+#endif  // RESTWISE_NO_RADIO
   loadBatterySettings(); // watchface indicator mode (icon vs. %), survives deep sleep
   buildMenu();
 
@@ -3391,6 +3442,10 @@ void setup() {
     batteryReadingValid = powerBootV > POWER_MIN_VALID_V;
     bool critical = powerBootV > POWER_MIN_VALID_V && powerBootV < POWER_CRIT_V;
     currentScreen = critical ? SCREEN_ECO_CRITICAL : SCREEN_ECO_CLOCK;
+  } else if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_UNDEFINED) {
+    // Woken from deep sleep (the CENTER press): check the timetable first and show the block that is running now.
+    // A plain power-on or a USB reset (cause UNDEFINED) still starts on the watchface.
+    currentScreen = rwWakeScreen();
   }
 }
 
@@ -3434,14 +3489,14 @@ void loop() {
       animOffsetY = 0;
       isAnimating = false;
 
-      // Every wake -- from idle blanking or deep sleep alike -- always lands
-      // on the watchface, except during configured night hours, when it
-      // shows the Good Night greeting instead. A real Restwise sync still
+      // Every wake from idle blanking checks the timetable first: if a block is
+      // running (or it is night) the block screen comes up, otherwise the
+      // watchface. (A wake from deep sleep does the same in setup().) A real Restwise sync still
       // finds its way back to the Restwise screen on its own the moment
       // traffic arrives (that handshake navigates there regardless of
       // currentScreen), so this doesn't drop an in-progress sync -- it just
       // stops resuming whatever screen you happened to be sitting on before.
-      currentScreen = isNightNow() ? SCREEN_GOODNIGHT : SCREEN_WATCHFACE;
+      currentScreen = rwWakeScreen();
 
       for (int i = 0; i < 5; i++) { buttonJustPressed[i] = false; btnLatched[i] = false; }
     }
@@ -3467,10 +3522,7 @@ void loop() {
   // halfway. This gives the Lock Screen timeout its intended global effect.
   bool dinoRunning = (currentScreen == SCREEN_DINO && dinoState == DINO_PLAYING);
   bool allowBlank = powerMode != PM_ECO && !isAnimating && currentScreen != SCREEN_ANIMATOR && !dinoRunning &&
-                     currentScreen != SCREEN_WIFI_SCANNING &&
-                     currentScreen != SCREEN_WIFI_PASSWORD &&
-                     currentScreen != SCREEN_WIFI_NTP &&
-                     !aiBusy && !dcBusy;
+                     !RW_RADIO_BUSY();
 
   if (displayOn && allowBlank) {
     if (millis() - lastActivityTime > DISPLAY_TIMEOUT_MS) {
@@ -3496,10 +3548,7 @@ void loop() {
   bool allowDeepSleep = powerMode == PM_BALANCED && !isAnimating && currentScreen != SCREEN_ANIMATOR && !dinoRunning &&
                         !swRunning && tmMode != TM_RUNNING &&
                         rwSyncState != RWS_RECV &&
-                        currentScreen != SCREEN_WIFI_SCANNING &&
-                        currentScreen != SCREEN_WIFI_PASSWORD &&
-                        currentScreen != SCREEN_WIFI_NTP &&
-                        !aiBusy && !dcBusy;
+                        !RW_RADIO_BUSY();
   if (allowDeepSleep && millis() - lastActivityTime > DEEP_SLEEP_TIMEOUT_MS) {
     enterDeepSleep();
   }
@@ -3579,6 +3628,7 @@ void loop() {
           } else if (app == APP_POWER) {
             powerMenuCursor = 0;
             startAnimation(SCREEN_POWER_MENU, -64);
+#ifndef RESTWISE_NO_RADIO
           } else if (app == APP_WIFI) {
             if (WiFi.status() == WL_CONNECTED) {
               wifiHomeCursor = 0;
@@ -3613,6 +3663,7 @@ void loop() {
             } else {
               startAnimation(SCREEN_DISCORD_NOWIFI, -64);
             }
+#endif  // RESTWISE_NO_RADIO
           } else if (app == APP_DINO) {
             dinoOpen();
             startAnimation(SCREEN_DINO, -64);
@@ -3695,6 +3746,7 @@ void loop() {
       else if (currentScreen == SCREEN_ECO_CLOCK || currentScreen == SCREEN_ECO_EXIT) {
         ecoHandleButtons();
       }
+#ifndef RESTWISE_NO_RADIO
       else if (currentScreen == SCREEN_DISCORD_NOWIFI) {
         if (buttonJustPressed[2] || buttonJustPressed[4]) startAnimation(SCREEN_MENU, 64);
       }
@@ -3988,6 +4040,7 @@ void loop() {
           }
         }
       }
+#endif  // RESTWISE_NO_RADIO
       else if (currentScreen == SCREEN_ANIMATOR) {
         // Passive playback screen -- the back box is always focused, CENTER exits.
         if (buttonJustPressed[4]) {
@@ -4386,15 +4439,15 @@ void loop() {
       }
       else if (currentScreen == SCREEN_RESTWISE_DAY) {
         // Passive scroll only -- rows aren't focusable. LEFT is the sole way back.
-        int idx[RW_DAY_MAX];
+        int *idx = rwDayIdx;
         int n = rwBuildDayList(rwResolveDayIndex(rwSelectedDayItem), idx, RW_DAY_MAX);
         int maxScroll = (n > RW_DAY_ROWS) ? (n - RW_DAY_ROWS) : 0;
         if (buttonJustPressed[0] && rwDayScroll > 0) rwDayScroll--;
         if (buttonJustPressed[1] && rwDayScroll < maxScroll) rwDayScroll++;
         if (buttonJustPressed[2]) startAnimation(SCREEN_RESTWISE, 64);
       }
-      else if (currentScreen == SCREEN_GOODNIGHT) {
-        // A passive bedtime greeting -- UP scrolls up to the watchface.
+      else if (currentScreen == SCREEN_BLOCK) {
+        // The block that is running now (or the bedtime greeting) -- UP scrolls up to the watchface.
         if (buttonJustPressed[0]) startAnimation(SCREEN_WATCHFACE, -64);
       }
     }
@@ -4433,6 +4486,7 @@ void loop() {
     }
   }
 
+#ifndef RESTWISE_NO_RADIO
   // ---- WiFi scan polling (async scanNetworks(), same pattern as AIO_Transmitter) ----
   if (currentScreen == SCREEN_WIFI_SCANNING && !isAnimating) {
     lastActivityTime = millis();
@@ -4514,6 +4568,7 @@ void loop() {
     }
   }
 
+#endif  // RESTWISE_NO_RADIO
   // Health line every 2 s (USB serial only): if the watch ever stops responding, the last of these
   // shows whether the loop was still running and what state the UI/buttons/memory were in.
   {
@@ -4523,7 +4578,7 @@ void loop() {
       if (Serial) {
         Serial.printf("[HB] t=%lus mode=%u v=%.2f scr=%d anim=%d disp=%d wifi=%d gw=%d%d loops=%lu maxIter=%luus frames=%lu heap=%u/%u stack=%u held=%d%d%d%d%d latch=%d%d%d%d%d edges=%lu/%lu/%lu/%lu/%lu\n",
                       millis() / 1000UL, (unsigned)powerMode, batteryVoltage, (int)currentScreen, (int)isAnimating, (int)displayOn,
-                      (int)WiFi.status(), (int)dcGwConnected, (int)dcPresenceSent, dbgLoops, dbgIterMaxUs, (unsigned long)dbgFrames,
+                      RW_HB_RADIO_FIELDS, dbgLoops, dbgIterMaxUs, (unsigned long)dbgFrames,
                       (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(), (unsigned)uxTaskGetStackHighWaterMark(NULL),
                       (int)buttonStates[0], (int)buttonStates[1], (int)buttonStates[2], (int)buttonStates[3], (int)buttonStates[4],
                       (int)btnLatched[0], (int)btnLatched[1], (int)btnLatched[2], (int)btnLatched[3], (int)btnLatched[4],
@@ -4604,6 +4659,7 @@ DateTime nowTime() {
 }
 
 void setDeviceTime(const DateTime &dt) {
+  rwCacheDirty = true;
   if (rtcPresent) {
     Wire.setClock(I2C_CLOCK_RTC);
     rtc.adjust(dt);
@@ -4697,21 +4753,24 @@ void drawScreen(ScreenState screen, int yOffset) {
   else if (screen == SCREEN_TERMINAL) drawTerminal(yOffset);
   else if (screen == SCREEN_RESTWISE) drawRestwise(yOffset);
   else if (screen == SCREEN_RESTWISE_DAY) drawRestwiseDay(yOffset);
-  else if (screen == SCREEN_GOODNIGHT) drawGoodNight(yOffset);
+  else if (screen == SCREEN_BLOCK) drawBlockScreen(yOffset);
   else if (screen == SCREEN_ANIMATOR) drawAnimator(yOffset);
   else if (screen == SCREEN_BATTERY) drawBattery(yOffset);
   else if (screen == SCREEN_BATTERY_INDICATOR) drawBatteryIndicator(yOffset);
   else if (screen == SCREEN_DINO) drawDino(yOffset);
+#ifndef RESTWISE_NO_RADIO
   else if (screen == SCREEN_DISCORD_NOWIFI) drawDiscordNoWifi(yOffset);
   else if (screen == SCREEN_DISCORD_LIST) drawDiscordList(yOffset);
   else if (screen == SCREEN_DISCORD_ADD) drawDiscordAdd(yOffset);
   else if (screen == SCREEN_DISCORD_DELETE) drawDiscordDelete(yOffset);
   else if (screen == SCREEN_DISCORD_CHAT) drawDiscordChat(yOffset);
+#endif  // RESTWISE_NO_RADIO
   else if (screen == SCREEN_POWER_MENU) drawPowerMenu(yOffset);
   else if (screen == SCREEN_POWER_CONFIRM) drawPowerConfirm(yOffset);
   else if (screen == SCREEN_ECO_CLOCK) drawWatchFace(yOffset); // Eco shows the ordinary watch face; only the buttons are locked down
   else if (screen == SCREEN_ECO_EXIT) drawEcoExit(yOffset);
   else if (screen == SCREEN_ECO_CRITICAL) drawEcoCritical(yOffset);
+#ifndef RESTWISE_NO_RADIO
   else if (screen == SCREEN_WIFI_CONFIRM) drawWifiConfirm(yOffset);
   else if (screen == SCREEN_WIFI_SCANNING) drawWifiScanning(yOffset);
   else if (screen == SCREEN_WIFI_RESULTS) drawWifiResults(yOffset);
@@ -4723,6 +4782,7 @@ void drawScreen(ScreenState screen, int yOffset) {
   else if (screen == SCREEN_WIFI_NTP) drawWifiNTP(yOffset);
   else if (screen == SCREEN_AI_NOWIFI) drawAiNoWifi(yOffset);
   else if (screen == SCREEN_AI_CHAT) drawAiChat(yOffset);
+#endif  // RESTWISE_NO_RADIO
 }
 
 void drawHeader(int yOffset, const char* appName, bool backFocused) {
@@ -4761,8 +4821,10 @@ void drawWatchFace(int yOffset) {
 
   drawHeader(yOffset);
   drawBatteryStatusGlyph(128 - 2, 2 + yOffset);
+#ifndef RESTWISE_NO_RADIO
   if (WiFi.status() == WL_CONNECTED) drawWifiStatusIcon(2, 2 + yOffset);
   if (internetOK) drawTowerStatusIcon(12, 2 + yOffset);
+#endif  // RESTWISE_NO_RADIO
 
   DateTime now = nowTime();
   uint16_t hour = now.hour();
@@ -5392,7 +5454,8 @@ bool isNightNow() {
     if (!(rwBlocks[i].days & (1 << todayIdx))) continue;
     String label = rwBlocks[i].label;
     label.toLowerCase();
-    if (label.indexOf("sleep") < 0) continue;
+    bool isSleep = (rwBlocks[i].cat == rwblk::C_SLEEP) || (rwBlocks[i].cat == rwblk::C_NONE && label.indexOf("sleep") >= 0);
+    if (!isSleep) continue;
 
     hasSleepBlockToday = true;
     int s = rwBlocks[i].startMin, e = rwBlocks[i].endMin;
@@ -5443,12 +5506,32 @@ int rwBuildDayList(int dayIdx, int* out, int maxOut) {
 }
 
 static void rwParseLine(const String &line) {
+  // "C|<key>|<Name>": a category name, synced from the website
+  if (line.length() > 2 && line[0] == 'C' && line[1] == '|') {
+    int q = line.indexOf('|', 2);
+    if (q > 2) {
+      int c = rwblk::catFromKey(line.substring(2, q).c_str());
+      String nm = line.substring(q + 1);
+      nm.trim();
+      if (c != rwblk::C_NONE && nm.length() > 0) nm.toCharArray(rwCatNames[c], rwblk::CAT_NAME_LEN);
+    }
+    return;
+  }
+
   int p1 = line.indexOf('|');
   int p2 = line.indexOf('|', p1 + 1);
   int p3 = line.indexOf('|', p2 + 1);
   if (p1 < 0 || p2 < 0 || p3 < 0) return;
 
-  long days = line.substring(0, p1).toInt();
+  // First field: "<days>" or "<days>:<category>"
+  String f0 = line.substring(0, p1);
+  uint8_t cat = rwblk::C_NONE;
+  int colon = f0.indexOf(':');
+  if (colon >= 0) {
+    cat = (uint8_t)rwblk::catFromKey(f0.substring(colon + 1).c_str());
+    f0 = f0.substring(0, colon);
+  }
+  long days = f0.toInt();
   long sm   = line.substring(p1 + 1, p2).toInt();
   long em   = line.substring(p2 + 1, p3).toInt();
   String label = line.substring(p3 + 1);
@@ -5460,6 +5543,7 @@ static void rwParseLine(const String &line) {
   b.days = (uint8_t)days;
   b.startMin = (uint16_t)sm;
   b.endMin = (uint16_t)em;
+  b.cat = cat;
   label.toCharArray(b.label, sizeof(b.label));
   rwBlockCount++;
 }
@@ -5467,6 +5551,8 @@ static void rwParseLine(const String &line) {
 void rwLoadFromFile() {
   rwBlockCount = 0;
   rwHasData = false;
+  rwResetCatNames();
+  rwCacheDirty = true;
 
   File f = LittleFS.open(RW_FILE, "r");
   if (!f) return;
@@ -5507,7 +5593,7 @@ void processRestwiseSerial() {
           Serial.print("RW_OK "); Serial.println(rwBlockCount);
         } else if (line.length() > 0) {
           if (rwFile) rwFile.println(line);
-          rwRecvCount++;
+          if (!(line.length() > 1 && line[0] == 'C' && line[1] == '|')) rwRecvCount++;   // category names are not blocks
         }
       } else { // RWS_IDLE
         if (line == "RW_HELLO") {
@@ -5609,7 +5695,7 @@ void drawRestwiseDay(int yOffset) {
   display.setCursor((128 - bw) / 2 - bx, 2 + yOffset);
   display.print(title);
 
-  int idx[RW_DAY_MAX];
+  int *idx = rwDayIdx;
   int n = rwBuildDayList(rwResolveDayIndex(rwSelectedDayItem), idx, RW_DAY_MAX);
 
   if (n == 0) {
@@ -5632,14 +5718,15 @@ void drawRestwiseDay(int yOffset) {
     display.setCursor(2, y);
     display.print(t);
 
-    // Label after the time, truncated to what fits (15 chars from x=38).
+    // Label after the time, truncated to what fits (15 chars from x=38). A block with no name shows its category's name.
+    const char* shown = b.label[0] ? b.label : ((b.cat < rwblk::C_COUNT) ? rwCatNames[b.cat] : "");
     display.setCursor(38, y);
     int maxChars = 15;
-    if ((int)strlen(b.label) <= maxChars) {
-      display.print(b.label);
+    if ((int)strlen(shown) <= maxChars) {
+      display.print(shown);
     } else {
       char trunc[16];
-      strncpy(trunc, b.label, maxChars - 1);
+      strncpy(trunc, shown, maxChars - 1);
       trunc[maxChars - 1] = '\0';
       display.print(trunc);
       display.print(".");
@@ -5655,19 +5742,49 @@ void drawRestwiseDay(int yOffset) {
   }
 }
 
-void drawGoodNight(int yOffset) {
-  // Crescent: a white disc with an offset black disc carving the curve out.
-  int cx = 64, cy = 26 + yOffset, r = 15;
-  display.fillCircle(cx, cy, r, SSD1306_WHITE);
-  display.fillCircle(cx + 7, cy - 4, r, SSD1306_BLACK);
+/* ---------------------------- Current-block screen ---------------------------- */
+// The old Good Night greeting, for every block: an icon on the left (from the block's CATEGORY: book, bowl, moon, clock,
+// car or bottle) and, on the right, the start-end time and the block's name. Only a night Sleep block says "Good Night!".
+// The layout lives in block_screen.h, which the PC test in host-test/ compares with the approved UI renders.
 
-  // A few stars for flair, kept clear of the moon.
-  display.fillCircle(28, 14 + yOffset, 1, SSD1306_WHITE);
-  display.fillCircle(100, 16 + yOffset, 1, SSD1306_WHITE);
-  display.fillCircle(94, 36 + yOffset, 1, SSD1306_WHITE);
+int rwCurrentBlockIndex() {
+  unsigned long ms = millis();
+  if (rwCacheDirty || ms - rwCachedAt >= 1000UL) {
+    DateTime now = nowTime();
+    rwCachedBlock = rwblk::findCurrent(rwBlocks, rwBlockCount, (now.dayOfTheWeek() + 6) % 7, now.hour() * 60 + now.minute());
+    rwCachedNight = (rwCachedBlock < 0) && isNightNow();
+    rwCachedAt = ms;
+    rwCacheDirty = false;
+  }
+  return rwCachedBlock;
+}
 
-  display.setTextColor(SSD1306_WHITE);
-  drawCenteredText(display, "Good Night!", 50 + yOffset, 1);
+// What a wake lands on: the block screen when a block is running (or it is night), otherwise the watchface.
+ScreenState rwWakeScreen() {
+  ScreenState s = SCREEN_WATCHFACE;
+  if (rtcPresent) {                           // without a real clock the time, and so the block, cannot be trusted
+    rwCacheDirty = true;
+    if (rwCurrentBlockIndex() >= 0 || rwCachedNight) s = SCREEN_BLOCK;
+  }
+  if (Serial) {                               // one line per wake (USB serial only), same style as [BTN] and [HB]
+    DateTime now = nowTime();
+    Serial.printf("[WAKE] rtc=%d %02d:%02d day=%d blocks=%d running=%d night=%d -> %s\n", (int)rtcPresent, now.hour(), now.minute(),
+                  (now.dayOfTheWeek() + 6) % 7, rwBlockCount, rwCachedBlock, (int)rwCachedNight, s == SCREEN_BLOCK ? "block screen" : "watchface");
+  }
+  return s;
+}
+
+void drawBlockScreen(int yOffset) {
+  int idx = rwCurrentBlockIndex();
+  if (idx >= 0) {
+    RwBlock &b = rwBlocks[idx];
+    const char* catName = (b.cat < rwblk::C_COUNT) ? rwCatNames[b.cat] : "";
+    rwblk::drawBlock(display, yOffset, b.label, b.startMin, b.endMin, b.cat, catName);
+  } else if (rwCachedNight) {
+    rwblk::drawBlock(display, yOffset, "Sleep", 0, 0, rwblk::C_SLEEP, rwCatNames[rwblk::C_SLEEP], false, true);   // night, but no Sleep block in the timetable
+  } else {
+    drawWatchFace(yOffset);                   // nothing is running right now: the plain watchface
+  }
 }
 
 /* ---------------------------- Animator ---------------------------- */
