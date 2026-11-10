@@ -100,6 +100,10 @@ On waking from deep sleep (and from idle screen-off) the watch checks the timeta
 
 Receiving a handshake auto-navigates the watch to the Restwise screen, since opening the serial port resets the chip back to the watchface. The received schedule is written straight to `/timetable.rw` on LittleFS and reloaded immediately once the transfer completes -- no reboot required.
 
+### The AI chatbot's personality
+
+The chatbot talks like a warm friend rather than a helpdesk: casual and short, on your side, it nudges you to sleep when it is late, and it says so honestly if you ask whether it is an AI. The persona is `AI_PERSONA_BASE` and `AI_PERSONA_STYLE` in `Restwise-watch.ino` (plain ASCII, under 40 words per reply). To make it personal, add an optional `AI_OWNER_PROFILE` to your **private** `ai_config.h` (see `ai_config.example.h`); it is never committed, but it is sent to Groq with every message, so keep it light. Full-radio build only: the no-radio build has no chatbot.
+
 ---
 
 ## 📁 Repository Structure

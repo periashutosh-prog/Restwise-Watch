@@ -16,4 +16,10 @@
 // spent on a separate `reasoning` field, and qwen3.x emits <think> blocks inline.
 #define GROQ_MODEL "groq/compound-mini"
 
+// OPTIONAL: a few facts about the watch's owner so the chatbot feels personal. Put the real one in your
+// own (gitignored) ai_config.h, never in the repo. It is sent to Groq with every message, so keep it light:
+// no address, phone number or other people's full names. One plain-ASCII string, no double quotes inside,
+// and no full stop at the end. Leave it out and the chatbot is just as friendly, only less personal.
+// #define AI_OWNER_PROFILE "Their name is Alex. They like football and coding, and prefer short, honest answers"
+
 #endif

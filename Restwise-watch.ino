@@ -339,6 +339,30 @@ const int AI_CTX_MSGS = 8;    // how many turns get resent as context
 AiMsg aiMsgs[AI_MAX_MSGS];
 int  aiMsgCount = 0;
 
+// The chatbot's personality (its "system prompt"): a warm friend, not a helpdesk.
+// AI_OWNER_PROFILE is OPTIONAL and lives in the gitignored ai_config.h, so personal details about the
+// owner never reach this public repo; without it the persona is the same, just not personal.
+// Keep all of this plain ASCII (the OLED font cannot draw anything else) and short: every request
+// resends it and Groq counts the tokens.
+#define AI_PERSONA_BASE \
+  "You are a warm, easygoing friend chatting with the owner of this watch. " \
+  "Talk like a real person, not a helpdesk: casual, short sentences, contractions, a little humour. " \
+  "Never say 'as an AI', never offer a menu of options, never use lists. " \
+  "Be on their side: listen first, encourage them, celebrate small wins, and be kind before giving advice. " \
+  "Reply to what they actually said, and now and then ask one short follow-up. " \
+  "This is a sleep watch, so if it is late, gently nudge them to rest. " \
+  "If they sincerely ask whether you are an AI, say yes, plainly and kindly. " \
+  "If they mention hurting themselves or being in danger, tell them to talk to a trusted adult right now."
+#define AI_PERSONA_STYLE \
+  " Replies show on a 128x64 pixel OLED: keep every reply under 40 words, plain ASCII only, " \
+  "no markdown, no emoji, no curly quotes or long dashes."
+#ifdef AI_OWNER_PROFILE
+  #define AI_SYSTEM_PROMPT AI_PERSONA_BASE " About them: " AI_OWNER_PROFILE \
+                           ". Use this naturally and never recite it back." AI_PERSONA_STYLE
+#else
+  #define AI_SYSTEM_PROMPT AI_PERSONA_BASE AI_PERSONA_STYLE
+#endif
+
 // Layout: header 0-12, transcript 13-48, input row 49-62.
 const int AI_LINE_H     = 9;
 const int AI_VIEW_TOP   = 14;
@@ -3163,9 +3187,7 @@ void aiSendMessage() {
   JsonArray msgs = doc["messages"].to<JsonArray>();
   JsonObject sys = msgs.add<JsonObject>();
   sys["role"]    = "system";
-  sys["content"] = "You are a helpful assistant answering on a 128x64 pixel OLED "
-                   "handheld. Keep every reply under 40 words. Use plain ASCII only: "
-                   "no markdown, no emoji, no curly quotes or long dashes.";
+  sys["content"] = AI_SYSTEM_PROMPT;   // persona defined next to the AI constants near the top
 
   int start = max(0, aiMsgCount - AI_CTX_MSGS);
   for (int i = start; i < aiMsgCount; i++) {
